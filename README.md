@@ -4,7 +4,7 @@ Concise English documentation for pi-ssh-remote, covering its purpose, installat
 
 # pi-ssh-remote
 
-[中文](README.zh-CN.md)
+[中文文档](README.zh-CN.md) · [Community](https://linux.do/)
 
 Use Pi's file and shell tools on a persistent remote SSH workspace. Supports multiple endpoints, remote working directories, reconnection, and local port forwarding.
 

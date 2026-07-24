@@ -4,7 +4,7 @@ pi-ssh-remote 的简明中文文档，说明扩展用途、安装方式、必要
 
 # pi-ssh-remote
 
-[English](README.md)
+[English Docs](README.md) · [社区](https://linux.do/)
 
 让 Pi 的文件与 Shell 工具在持久化 SSH 远程工作区中运行。支持多个服务器、远程工作目录、自动重连和本地端口转发。
 
