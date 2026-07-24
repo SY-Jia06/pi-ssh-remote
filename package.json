@@ -4,6 +4,7 @@
   "description": "Persistent remote SSH workspaces for Pi.",
   "type": "module",
   "author": "Yutong Bian",
+  "license": "MIT",
   "keywords": [
     "pi-package",
     "pi",
@@ -13,7 +14,8 @@
   "files": [
     "index.ts",
     "README.md",
-    "README.zh-CN.md"
+    "README.zh-CN.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=20"

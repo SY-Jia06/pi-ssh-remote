@@ -33,3 +33,5 @@ Uses SSH agent authentication when available, otherwise prompts for a password. 
 Only direct SSH commands with `-p` and `-l` are supported. `~/.ssh/config`, `IdentityFile`, and ProxyJump are not currently supported.
 
 Requires Node.js 20+, Bash, SFTP, and GNU `timeout` on the remote host.
+
+MIT licensed.

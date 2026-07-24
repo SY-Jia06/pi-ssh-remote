@@ -33,3 +33,5 @@ pi install npm:pi-ssh-remote
 目前仅支持带 `-p` 和 `-l` 的直连 SSH 命令，暂不支持 `~/.ssh/config`、`IdentityFile` 和 ProxyJump。
 
 要求 Node.js 20+；远程服务器需提供 Bash、SFTP 和 GNU `timeout`。
+
+采用 MIT 许可证。
