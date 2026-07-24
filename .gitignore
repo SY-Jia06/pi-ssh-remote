@@ -1,4 +1,5 @@
-# Excludes installed dependencies, npm tarballs, logs, temporary files, and editor metadata from the pi-ssh-remote source repository.
+# Excludes installed dependencies, npm tarballs, logs, temporary files, local agent instructions, and editor metadata from the pi-ssh-remote source repository.
+AGENTS.md
 node_modules/
 *.tgz
 *.log
