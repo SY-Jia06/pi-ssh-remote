@@ -1,0 +1,43 @@
+{
+  "name": "pi-ssh-remote",
+  "version": "0.1.0",
+  "description": "Persistent remote SSH workspaces for Pi.",
+  "type": "module",
+  "author": "Yutong Bian",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "ssh",
+    "remote-development"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/petrichor20211/pi-ssh-remote.git"
+  },
+  "homepage": "https://github.com/petrichor20211/pi-ssh-remote#readme",
+  "bugs": {
+    "url": "https://github.com/petrichor20211/pi-ssh-remote/issues"
+  },
+  "dependencies": {
+    "ssh2": "^1.17.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

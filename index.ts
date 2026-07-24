@@ -1,0 +1,891 @@
+/**
+ * Pi SSH Remote extension.
+ *
+ * Provides persistent SSH workspaces for Pi by routing file and shell tools to
+ * a verified remote host. It manages endpoint configuration, in-memory
+ * credentials, remote working directories, reconnection, and TCP forwarding.
+ */
+
+import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
+import { createServer, type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { Type } from "typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  createBashTool,
+  createEditTool,
+  createReadTool,
+  createWriteTool,
+  formatSize,
+  truncateTail,
+  type BashOperations,
+  type EditOperations,
+  type ReadOperations,
+  type WriteOperations,
+} from "@earendil-works/pi-coding-agent";
+import { CURSOR_MARKER, Key, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
+
+interface ParsedSsh {
+  host: string;
+  port: number;
+  username: string;
+  label: string;
+  command: string;
+}
+
+interface RemoteState extends ParsedSsh {
+  client: Client;
+  cwd: string;
+}
+
+interface CredentialCache {
+  passwords: Map<string, string>;
+  resume?: { command: string; cwd: string };
+}
+
+interface RemoteEndpointConfig {
+  sshCommand?: string;
+  remoteCwd?: string;
+  forwards?: string[];
+}
+
+interface RemoteConfig {
+  activeEndpoint?: string;
+  endpoints?: Record<string, RemoteEndpointConfig>;
+  /** Legacy fields migrated into endpoints on the next config write. */
+  sshCommand?: string;
+  remoteCwd?: string;
+  forwards?: string[];
+}
+
+interface ForwardSpec {
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+}
+
+const AGENT_DIR = join(process.env.HOME || ".", CONFIG_DIR_NAME, "agent");
+const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
+const REMOTE_CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
+const FALLBACK_REMOTE_CWD = "~";
+const CACHE_KEY = "__piHpcCredentialCacheV1";
+const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
+const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>() };
+
+function shellWords(input: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let quoteChar: "'" | '"' | null = null;
+  let escaped = false;
+  for (const ch of input.trim()) {
+    if (escaped) { word += ch; escaped = false; continue; }
+    if (ch === "\\" && quoteChar !== "'") { escaped = true; continue; }
+    if (quoteChar) { if (ch === quoteChar) quoteChar = null; else word += ch; continue; }
+    if (ch === "'" || ch === '"') { quoteChar = ch; continue; }
+    if (/\s/.test(ch)) { if (word) { words.push(word); word = ""; } }
+    else word += ch;
+  }
+  if (escaped || quoteChar) throw new Error("Incomplete quoting or escaping in SSH command");
+  if (word) words.push(word);
+  return words;
+}
+
+function parseSshCommand(command: string): ParsedSsh {
+  const args = shellWords(command);
+  if (args[0] !== "ssh") throw new Error("Command must start with ssh, for example: ssh root@host -p 22");
+  let port = 22;
+  let username = process.env.USER || "root";
+  let target: string | undefined;
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "-p") { port = Number(args[++i]); continue; }
+    if (arg.startsWith("-p") && arg.length > 2) { port = Number(arg.slice(2)); continue; }
+    if (arg === "-l") { username = args[++i] || username; continue; }
+    if (arg.startsWith("-")) throw new Error(`Unsupported SSH option ${arg}; only -p and -l are currently supported`);
+    if (!target) target = arg;
+    else throw new Error("Unexpected extra argument in SSH command");
+  }
+  if (!target || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid SSH host or port");
+  const at = target.lastIndexOf("@");
+  const host = at >= 0 ? target.slice(at + 1) : target;
+  if (at >= 0) username = target.slice(0, at);
+  if (!host || !username) throw new Error("Invalid SSH username or host");
+  return { host, port, username, label: `${username}@${host}:${port}`, command };
+}
+
+function cacheId(config: ParsedSsh): string {
+  return `${config.username}@${config.host}:${config.port}`;
+}
+
+function getCachedPassword(config: ParsedSsh): string | undefined {
+  return credentialCache.passwords.get(cacheId(config));
+}
+
+function setCachedPassword(config: ParsedSsh, password: string): void {
+  credentialCache.passwords.set(cacheId(config), password);
+}
+
+function deleteCachedPassword(config: ParsedSsh): void {
+  credentialCache.passwords.delete(cacheId(config));
+}
+
+function parseForwardSpec(value: string): ForwardSpec {
+  const match = value.match(/^(\d+):([^:]+):(\d+)$/);
+  if (!match) throw new Error(`Invalid port-forward specification: ${value}; expected LOCAL_PORT:REMOTE_HOST:REMOTE_PORT`);
+  const localPort = Number(match[1]);
+  const remoteHost = match[2]!;
+  const remotePort = Number(match[3]);
+  if (![localPort, remotePort].every((port) => Number.isInteger(port) && port > 0 && port <= 65535)) {
+    throw new Error(`Port out of range in forwarding specification: ${value}`);
+  }
+  return { localPort, remoteHost, remotePort };
+}
+
+function quote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function commandFromEndpointKey(key: string): string | undefined {
+  const match = key.match(/^([^@]+)@(.+):(\d+)$/);
+  if (!match) return undefined;
+  const [, username, host, port] = match;
+  return `ssh ${username}@${host} -p ${port}`;
+}
+
+function normalizeRemoteConfig(config: RemoteConfig): RemoteConfig {
+  const endpoints = { ...(config.endpoints ?? {}) };
+  for (const [key, endpoint] of Object.entries(endpoints)) {
+    endpoints[key] = {
+      ...endpoint,
+      ...(endpoint.sshCommand ? {} : { sshCommand: commandFromEndpointKey(key) }),
+    };
+  }
+
+  let activeEndpoint = config.activeEndpoint;
+  if (config.sshCommand) {
+    try {
+      const key = cacheId(parseSshCommand(config.sshCommand));
+      endpoints[key] = {
+        ...(endpoints[key] ?? {}),
+        sshCommand: config.sshCommand,
+        ...(config.remoteCwd !== undefined ? { remoteCwd: config.remoteCwd } : {}),
+        ...(config.forwards !== undefined ? { forwards: config.forwards } : {}),
+      };
+      activeEndpoint ??= key;
+    } catch {}
+  }
+  if (activeEndpoint && !endpoints[activeEndpoint]) activeEndpoint = undefined;
+  activeEndpoint ??= Object.keys(endpoints)[0];
+
+  return {
+    ...(activeEndpoint ? { activeEndpoint } : {}),
+    ...(Object.keys(endpoints).length ? { endpoints } : {}),
+  };
+}
+
+function loadRemoteConfig(): RemoteConfig {
+  try { return normalizeRemoteConfig(JSON.parse(readFileSync(REMOTE_CONFIG_FILE, "utf8"))); }
+  catch { return {}; }
+}
+
+function saveRemoteConfig(config: RemoteConfig): void {
+  mkdirSync(dirname(REMOTE_CONFIG_FILE), { recursive: true });
+  writeFileSync(REMOTE_CONFIG_FILE, JSON.stringify(normalizeRemoteConfig(config), null, 2) + "\n", { mode: 0o600 });
+}
+
+function endpointConfig(config: RemoteConfig, command: string): RemoteEndpointConfig {
+  try { return config.endpoints?.[cacheId(parseSshCommand(command))] ?? {}; }
+  catch { return {}; }
+}
+
+function activeEndpointConfig(config: RemoteConfig): RemoteEndpointConfig | undefined {
+  return config.activeEndpoint ? config.endpoints?.[config.activeEndpoint] : undefined;
+}
+
+function activeSshCommand(config = loadRemoteConfig()): string | undefined {
+  return activeEndpointConfig(config)?.sshCommand;
+}
+
+function saveEndpointConfig(command: string, updates: RemoteEndpointConfig, makeActive = false): void {
+  const config = loadRemoteConfig();
+  const key = cacheId(parseSshCommand(command));
+  saveRemoteConfig({
+    ...config,
+    ...(makeActive ? { activeEndpoint: key } : {}),
+    endpoints: {
+      ...(config.endpoints ?? {}),
+      [key]: { ...endpointConfig(config, command), sshCommand: command, ...updates },
+    },
+  });
+}
+
+function loadKnownHosts(): Record<string, string> {
+  try { return JSON.parse(readFileSync(KNOWN_HOSTS_FILE, "utf8")); }
+  catch { return {}; }
+}
+
+function saveKnownHost(key: string, fingerprint: string): void {
+  const hosts = loadKnownHosts();
+  hosts[key] = fingerprint;
+  mkdirSync(dirname(KNOWN_HOSTS_FILE), { recursive: true });
+  writeFileSync(KNOWN_HOSTS_FILE, JSON.stringify(hosts, null, 2) + "\n", { mode: 0o600 });
+}
+
+function displayFingerprint(hex: string): string {
+  return `SHA256:${Buffer.from(hex, "hex").toString("base64").replace(/=+$/, "")}`;
+}
+
+function formatRemoteOutput(output: string): { text: string; fullOutputPath?: string } {
+  const truncated = truncateTail(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+  if (!truncated.truncated) return { text: truncated.content || "Remote command completed." };
+
+  const outputDir = mkdtempSync(join(tmpdir(), "pi-ssh-remote-output-"));
+  const fullOutputPath = join(outputDir, "output.log");
+  writeFileSync(fullOutputPath, output, { encoding: "utf8", mode: 0o600 });
+  const text = `${truncated.content}\n\n[Output truncated: ${truncated.outputLines} of ${truncated.totalLines} lines (${formatSize(truncated.outputBytes)} of ${formatSize(truncated.totalBytes)}). Full output saved locally to: ${fullOutputPath}]`;
+  return { text, fullOutputPath };
+}
+
+function probeFingerprint(config: ParsedSsh): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const client = new Client();
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; client.end(); reject(new Error("Connection timed out")); }
+    }, 10000);
+    client.on("error", (error) => {
+      if (!settled) { settled = true; clearTimeout(timer); reject(error); }
+    });
+    client.connect({
+      host: config.host,
+      port: config.port,
+      username: config.username,
+      readyTimeout: 8000,
+      hostHash: "sha256",
+      hostVerifier: (hash) => {
+        if (!settled) { settled = true; clearTimeout(timer); resolve(hash); }
+        setImmediate(() => client.end());
+        return false;
+      },
+    });
+  });
+}
+
+function connect(config: ParsedSsh, password: string | undefined, fingerprint: string): Promise<Client> {
+  return new Promise((resolve, reject) => {
+    const client = new Client();
+    const options: ConnectConfig = {
+      host: config.host,
+      port: config.port,
+      username: config.username,
+      ...(password ? { password } : {}),
+      ...(process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
+      readyTimeout: 12000,
+      keepaliveInterval: 15000,
+      keepaliveCountMax: 3,
+      hostHash: "sha256",
+      hostVerifier: (hash) => hash === fingerprint,
+    };
+    client.once("ready", () => resolve(client));
+    client.once("error", reject);
+    client.connect(options);
+  });
+}
+
+function execRemote(client: Client, command: string, allowFailure = false): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    client.exec(command, (error, stream) => {
+      if (error) return reject(error);
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      stream.on("data", (chunk: Buffer) => stdout.push(chunk));
+      stream.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      stream.on("close", (code: number | null) => {
+        if (!allowFailure && code !== 0) reject(new Error(Buffer.concat(stderr).toString().trim() || `Remote command exited with code ${code}`));
+        else resolve(Buffer.concat(stdout));
+      });
+    });
+  });
+}
+
+function getSftp(client: Client): Promise<SFTPWrapper> {
+  return new Promise((resolve, reject) => client.sftp((error, sftp) => error ? reject(error) : resolve(sftp)));
+}
+
+async function withSftp<T>(client: Client, operation: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
+  const sftp = await getSftp(client);
+  try { return await operation(sftp); }
+  finally { sftp.end(); }
+}
+
+function isReconnectable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /channel open failure|open failed|not connected|no response|econnreset|econnrefused|etimedout|ehostunreach|epipe|connection (?:lost|closed)|socket.*closed|client is not connected/i.test(message);
+}
+
+class PasswordInput implements Component, Focusable {
+  focused = false;
+  private value = "";
+  constructor(private done: (value: string | null) => void, private renderNow: () => void) {}
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.enter)) return this.done(this.value);
+    if (matchesKey(data, Key.escape)) return this.done(null);
+    if (matchesKey(data, Key.backspace)) this.value = [...this.value].slice(0, -1).join("");
+    else if (matchesKey(data, Key.ctrl("u"))) this.value = "";
+    else {
+      const clean = data.replace(/\x1b\[200~/g, "").replace(/\x1b\[201~/g, "");
+      if ([...clean].every((ch) => ch.charCodeAt(0) >= 32 && ch.charCodeAt(0) !== 127)) this.value += clean;
+    }
+    this.renderNow();
+  }
+  render(width: number): string[] {
+    return [truncateToWidth(`SSH password: ${"•".repeat([...this.value].length)}${this.focused ? CURSOR_MARKER : ""}\x1b[7m \x1b[27m`, width, "")];
+  }
+  invalidate(): void {}
+}
+
+async function askPassword(ctx: any): Promise<string | null> {
+  if (ctx.mode !== "tui") return (await ctx.ui.input("SSH password:", "password")) ?? null;
+  return ctx.ui.custom<string | null>((tui: any, _theme: any, _keys: any, done: (value: string | null) => void) =>
+    new PasswordInput(done, () => tui.requestRender()));
+}
+
+export default function sshRemoteExtension(pi: ExtensionAPI) {
+  const localCwd = process.cwd();
+  let remote: RemoteState | null = null;
+  let routeRemoteTools = false;
+  let currentCtx: any;
+  let reconnectPromise: Promise<RemoteState> | null = null;
+  const forwardServers = new Map<number, Server>();
+  let lastConnectionError: string | undefined;
+  let lastCommand = credentialCache.resume?.command ?? activeSshCommand() ?? "";
+
+  const configuredCwd = (command: string): string =>
+    endpointConfig(loadRemoteConfig(), command).remoteCwd || FALLBACK_REMOTE_CWD;
+
+  const configuredForwards = (command: string): string[] =>
+    endpointConfig(loadRemoteConfig(), command).forwards ?? [];
+
+  const mapPath = (path: string): string => {
+    if (!remote) return path;
+    if (path === localCwd) return remote.cwd;
+    const prefix = localCwd.endsWith(sep) ? localCwd : localCwd + sep;
+    if (path.startsWith(prefix)) return remote.cwd.replace(/\/$/, "") + "/" + relative(localCwd, path).split(sep).join("/");
+    return path;
+  };
+
+  const status = (ctx: any) => {
+    currentCtx = ctx;
+    if (!remote) ctx.ui.setStatus("ssh-remote", undefined);
+    else if (routeRemoteTools) ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH remote ${remote.label}:${remote.cwd}`));
+    else ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH remote tunnel ${[...forwardServers.keys()].join(",") || remote.label}`));
+  };
+
+  const attachClient = (state: RemoteState) => {
+    const { client } = state;
+    client.on("close", () => {
+      if (remote?.client !== client) return;
+      if (currentCtx) {
+        currentCtx.ui.setStatus("ssh-remote", currentCtx.ui.theme.fg("warning", `SSH remote reconnecting ${state.label}…`));
+      }
+      void reconnectRemote().catch((error) => {
+        if (currentCtx) currentCtx.ui.notify(`SSH remote automatic reconnection failed: ${(error as Error).message}`, "error");
+      });
+    });
+  };
+
+  const establish = async (parsed: ParsedSsh, password: string | undefined, cwd: string): Promise<RemoteState> => {
+    const key = `${parsed.host}:${parsed.port}`;
+    const fingerprint = loadKnownHosts()[key];
+    if (!fingerprint) throw new Error(`Host ${key} is not trusted; connect interactively with /remote first`);
+    const client = await connect(parsed, password, fingerprint);
+    try {
+      const cdCommand = cwd === FALLBACK_REMOTE_CWD ? "cd -- ~" : `cd -- ${quote(cwd)}`;
+      const resolved = (await execRemote(client, `${cdCommand} && pwd -P`)).toString().trim();
+      const state = { ...parsed, client, cwd: resolved };
+      attachClient(state);
+      return state;
+    } catch (error) {
+      client.end();
+      throw error;
+    }
+  };
+
+  async function reconnectRemote(): Promise<RemoteState> {
+    if (reconnectPromise) return reconnectPromise;
+    const source = remote ?? (credentialCache.resume ? { ...parseSshCommand(credentialCache.resume.command), cwd: credentialCache.resume.cwd } : null);
+    if (!source) throw new Error("No SSH remote connection is available to reconnect");
+    const parsed = parseSshCommand(source.command);
+    const password = getCachedPassword(parsed);
+    reconnectPromise = (async () => {
+      const oldClient = remote?.client;
+      const next = await establish(parsed, password, source.cwd);
+      remote = next;
+      credentialCache.resume = { command: parsed.command, cwd: next.cwd };
+      oldClient?.end();
+      if (currentCtx) {
+        status(currentCtx);
+        currentCtx.ui.notify(`SSH remote reconnected automatically: ${next.label}:${next.cwd}`, "info");
+      }
+      return next;
+    })().finally(() => { reconnectPromise = null; });
+    return reconnectPromise;
+  }
+
+  const withReconnect = async <T>(operation: (client: Client) => Promise<T>): Promise<T> => {
+    if (!remote) throw new Error("SSH remote is not connected");
+    try { return await operation(remote.client); }
+    catch (error) {
+      if (!isReconnectable(error)) throw error;
+      const state = await reconnectRemote();
+      return operation(state.client);
+    }
+  };
+
+  const changeRemoteCwd = async (requested: string, ctx: any): Promise<string> => {
+    if (!remote) throw new Error("SSH remote is not connected");
+    const target = requested.trim() || FALLBACK_REMOTE_CWD;
+    const targetCommand = target === FALLBACK_REMOTE_CWD ? "cd -- ~" : `cd -- ${quote(target)}`;
+    const resolved = (await withReconnect((client) => execRemote(
+      client,
+      `cd -- ${quote(remote!.cwd)} && ${targetCommand} && pwd -P`,
+    ))).toString().trim();
+    remote.cwd = resolved;
+    credentialCache.resume = { command: remote.command, cwd: resolved };
+    saveEndpointConfig(remote.command, { remoteCwd: resolved }, true);
+    status(ctx);
+    return resolved;
+  };
+
+  const standaloneCdTarget = (command: string): string | undefined => {
+    try {
+      const words = shellWords(command);
+      if (words[0] !== "cd" || words.length > 3) return undefined;
+      if (words.length === 3 && words[1] !== "--") return undefined;
+      return words.at(-1) === "cd" || words.at(-1) === "--" ? FALLBACK_REMOTE_CWD : words.at(-1);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const connectInteractive = async (command: string, ctx: any, cwd?: string): Promise<RemoteState | null> => {
+    let parsed: ParsedSsh;
+    try { parsed = parseSshCommand(command); }
+    catch (error) {
+      lastConnectionError = (error as Error).message;
+      ctx.ui.notify(lastConnectionError, "error");
+      return null;
+    }
+    lastConnectionError = undefined;
+
+    const key = `${parsed.host}:${parsed.port}`;
+    const savedFingerprint = loadKnownHosts()[key];
+    const fingerprint = await probeFingerprint(parsed);
+    if (!savedFingerprint) {
+      const trusted = await ctx.ui.confirm("Trust SSH host", `${parsed.label}\nHost key: ${displayFingerprint(fingerprint)}\nTrust and save this key?`);
+      if (!trusted) { lastConnectionError = "The host key was not trusted"; return null; }
+      saveKnownHost(key, fingerprint);
+    } else if (savedFingerprint !== fingerprint) {
+      const trusted = await ctx.ui.confirm(
+        "SSH host key changed",
+        `${parsed.label}\nPrevious key: ${displayFingerprint(savedFingerprint)}\nNew key: ${displayFingerprint(fingerprint)}\nVerify the server identity. Update the saved key and continue?`,
+      );
+      if (!trusted) { lastConnectionError = "The changed host key was rejected"; return null; }
+      saveKnownHost(key, fingerprint);
+    }
+
+    let password = getCachedPassword(parsed);
+    ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `SSH remote connecting ${parsed.label}…`));
+    try {
+      let next: RemoteState;
+      try {
+        next = await establish(parsed, password, cwd ?? configuredCwd(command));
+      } catch (error) {
+        if (!/authentication methods failed|authentication failure/i.test((error as Error).message)) throw error;
+        password = await askPassword(ctx) ?? undefined;
+        if (!password) {
+          lastConnectionError = "No SSH password was provided and SSH agent authentication failed";
+          status(ctx);
+          return null;
+        }
+        next = await establish(parsed, password, cwd ?? configuredCwd(command));
+      }
+      const previous = remote?.client;
+      remote = next;
+      routeRemoteTools = true;
+      previous?.end();
+      if (password) setCachedPassword(parsed, password);
+      credentialCache.resume = { command, cwd: next.cwd };
+      lastCommand = command;
+      lastConnectionError = undefined;
+      saveEndpointConfig(command, { remoteCwd: next.cwd }, true);
+      status(ctx);
+      ctx.ui.notify(`SSH remote connected: ${parsed.label}:${next.cwd}`, "info");
+      return next;
+    } catch (error) {
+      deleteCachedPassword(parsed);
+      remote = null;
+      lastConnectionError = (error as Error).message;
+      status(ctx);
+      ctx.ui.notify(`SSH remote connection failed: ${lastConnectionError}`, "error");
+      return null;
+    }
+  };
+
+  const ensureConnected = async (ctx: any): Promise<RemoteState> => {
+    if (remote) return remote;
+    if (credentialCache.resume) return reconnectRemote();
+    const command = lastCommand || activeSshCommand();
+    if (!command) throw new Error("No SSH endpoint configured; use /remote config ssh ssh USER@HOST -p PORT");
+    const state = await connectInteractive(command, ctx, configuredCwd(command));
+    if (!state) throw new Error("SSH remote connection was cancelled or failed");
+    return state;
+  };
+
+  const startForward = async (spec: ForwardSpec): Promise<void> => {
+    if (forwardServers.has(spec.localPort)) return;
+    const server = createServer((socket: Socket) => {
+      void withReconnect((client) => new Promise<ClientChannel>((resolve, reject) =>
+        client.forwardOut("127.0.0.1", 0, spec.remoteHost, spec.remotePort, (error, stream) =>
+          error ? reject(error) : resolve(stream)))).then((stream) => {
+            socket.on("error", () => stream.close());
+            stream.on("error", () => socket.destroy());
+            socket.pipe(stream).pipe(socket);
+          }, () => socket.destroy());
+    });
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => { server.close(); reject(error); };
+      server.once("error", onError);
+      server.listen(spec.localPort, "127.0.0.1", () => {
+        server.off("error", onError);
+        server.on("error", () => {});
+        resolve();
+      });
+    });
+    forwardServers.set(spec.localPort, server);
+  };
+
+  const stopForwards = async (): Promise<void> => {
+    const servers = [...forwardServers.values()];
+    forwardServers.clear();
+    await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  };
+
+  const disconnect = (ctx: any, forgetPassword = false) => {
+    const previous = remote;
+    remote = null;
+    routeRemoteTools = false;
+    reconnectPromise = null;
+    credentialCache.resume = undefined;
+    void stopForwards();
+    if (forgetPassword) {
+      if (previous) deleteCachedPassword(previous);
+      else {
+        const configured = activeSshCommand();
+        if (configured) {
+          try { deleteCachedPassword(parseSshCommand(configured)); } catch {}
+        }
+      }
+    }
+    previous?.client.end();
+    status(ctx);
+    ctx.ui.notify(forgetPassword ? "SSH remote disconnected and cached password cleared" : "SSH remote mode disabled (password remains cached in memory only)", "info");
+  };
+
+  const remoteReadOps = (): ReadOperations => ({
+    readFile: (path) => withReconnect((client) => withSftp(client, (sftp) =>
+      new Promise<Buffer>((resolve, reject) => sftp.readFile(mapPath(path), (error, data) => error ? reject(error) : resolve(data))))),
+    access: (path) => withReconnect((client) => withSftp(client, (sftp) =>
+      new Promise<void>((resolve, reject) => sftp.stat(mapPath(path), (error) => error ? reject(error) : resolve())))),
+    detectImageMimeType: async (path) => {
+      try {
+        const mime = (await withReconnect((client) => execRemote(client, `file --mime-type -b -- ${quote(mapPath(path))}`))).toString().trim();
+        return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime) ? mime : null;
+      } catch { return null; }
+    },
+  });
+
+  const remoteWriteOps = (): WriteOperations => ({
+    writeFile: (path, content) => withReconnect((client) => withSftp(client, (sftp) =>
+      new Promise<void>((resolve, reject) => sftp.writeFile(mapPath(path), content, (error) => error ? reject(error) : resolve())))),
+    mkdir: async (path) => { await withReconnect((client) => execRemote(client, `mkdir -p -- ${quote(mapPath(path))}`)); },
+  });
+
+  const remoteEditOps = (): EditOperations => {
+    const read = remoteReadOps();
+    const write = remoteWriteOps();
+    return { readFile: read.readFile, access: read.access, writeFile: write.writeFile };
+  };
+
+  const openExecChannel = async (command: string): Promise<ClientChannel> =>
+    withReconnect((client) => new Promise<ClientChannel>((resolve, reject) =>
+      client.exec(command, (error, stream) => error ? reject(error) : resolve(stream))));
+
+  const remoteBashOps = (): BashOperations => ({
+    exec: (command, cwd, { onData, signal, timeout }) => new Promise((resolve, reject) => {
+      const timeoutSeconds = timeout ? Math.max(1, Math.ceil(timeout)) : undefined;
+      const remoteCommand = timeoutSeconds
+        ? `timeout --signal=TERM --kill-after=5s ${timeoutSeconds}s bash -lc ${quote(command)}`
+        : command;
+      const full = `cd -- ${quote(mapPath(cwd))} && ${remoteCommand}`;
+      void openExecChannel(full).then((stream) => {
+        let timedOut = false;
+        const timer = timeoutSeconds ? setTimeout(() => { timedOut = true; stream.close(); }, (timeoutSeconds + 8) * 1000) : undefined;
+        const abort = () => stream.close();
+        signal?.addEventListener("abort", abort, { once: true });
+        stream.on("data", onData);
+        stream.stderr.on("data", onData);
+        stream.on("close", (code: number | null) => {
+          if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          if (signal?.aborted) reject(new Error("aborted"));
+          else if (timedOut || code === 124) reject(new Error(`timeout:${timeoutSeconds}`));
+          else resolve({ exitCode: code });
+        });
+      }, reject);
+    }),
+  });
+
+  const localRead = createReadTool(localCwd);
+  const localWrite = createWriteTool(localCwd);
+  const localEdit = createEditTool(localCwd);
+  const localBash = createBashTool(localCwd);
+  pi.registerTool({ ...localRead, execute: (id, params, signal, update) => remote && routeRemoteTools ? createReadTool(localCwd, { operations: remoteReadOps() }).execute(id, params, signal, update) : localRead.execute(id, params, signal, update) });
+  pi.registerTool({ ...localWrite, execute: (id, params, signal, update) => remote && routeRemoteTools ? createWriteTool(localCwd, { operations: remoteWriteOps() }).execute(id, params, signal, update) : localWrite.execute(id, params, signal, update) });
+  pi.registerTool({ ...localEdit, execute: (id, params, signal, update) => remote && routeRemoteTools ? createEditTool(localCwd, { operations: remoteEditOps() }).execute(id, params, signal, update) : localEdit.execute(id, params, signal, update) });
+  pi.registerTool({ ...localBash, execute: (id, params, signal, update) => remote && routeRemoteTools ? createBashTool(localCwd, { operations: remoteBashOps() }).execute(id, params, signal, update) : localBash.execute(id, params, signal, update) });
+
+  pi.registerTool({
+    name: "ssh_remote_control",
+    label: "SSH Remote Control",
+    description: "Connect, reconnect, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Passwords are never accepted as arguments and are cached only in process memory. Command output is limited to 50KB or 2000 lines; truncated output is saved to a local temporary file.",
+    promptSnippet: "Control the configured remote SSH connection, working directory, and local port forwarding",
+    promptGuidelines: [
+      "Use ssh_remote_control when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
+      "Use ssh_remote_control with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
+      "Use ssh_remote_control with action disconnect after remote work when the user asks to return to the local environment.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir"] as const),
+      command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22" })),
+      cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
+      forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
+      remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (params.action === "status") {
+        const mappings = [...forwardServers.keys()].sort((a, b) => a - b);
+        const text = `${remote ? `Connected: ${remote.label}:${remote.cwd}; tool routing: ${routeRemoteTools ? "remote" : "local"}` : "SSH remote is disconnected"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}`;
+        return { content: [{ type: "text", text }], details: { connected: Boolean(remote), cwd: remote?.cwd, toolRouting: routeRemoteTools ? "remote" : "local", forwardedPorts: mappings } };
+      }
+      if (params.action === "disconnect" || params.action === "forget") {
+        disconnect(ctx, params.action === "forget");
+        return { content: [{ type: "text", text: params.action === "forget" ? "Disconnected and forgot the cached password." : "Disconnected from SSH remote and returned to local tools." }], details: { connected: false } };
+      }
+      if (params.action === "reconnect") {
+        if (!remote && !credentialCache.resume) throw new Error("No SSH remote connection is available to reconnect");
+        const state = await reconnectRemote();
+        return { content: [{ type: "text", text: `Reconnected: ${state.label}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
+      }
+      if (params.action === "unforward") {
+        await stopForwards();
+        return { content: [{ type: "text", text: "Closed all extension-managed SSH port forwards." }], details: { forwardedPorts: [] } };
+      }
+      if (params.action === "forward") {
+        const state = await ensureConnected(ctx);
+        const values = params.forwards?.trim().split(/\s+/).filter(Boolean) ?? configuredForwards(state.command);
+        if (!values.length) throw new Error(`No port mappings configured in ${REMOTE_CONFIG_FILE}`);
+        const specs = values.map(parseForwardSpec);
+        for (const spec of specs) await startForward(spec);
+        routeRemoteTools = false;
+        if (currentCtx) status(currentCtx);
+        const ports = specs.map((spec) => spec.localPort);
+        return { content: [{ type: "text", text: `Forwarded local ports: ${ports.join(", ")}; tools remain local.` }], details: { toolRouting: "local", forwardedPorts: ports } };
+      }
+      if (params.action === "chdir") {
+        await ensureConnected(ctx);
+        if (!params.cwd) throw new Error("cwd is required for chdir");
+        const resolved = await changeRemoteCwd(params.cwd, ctx);
+        return { content: [{ type: "text", text: `Remote working directory: ${resolved}` }], details: { connected: true, cwd: resolved } };
+      }
+      if (params.action === "exec") {
+        const state = await ensureConnected(ctx);
+        if (!params.remoteCommand) throw new Error("remoteCommand is required for exec");
+        const cdTarget = params.cwd === undefined ? standaloneCdTarget(params.remoteCommand) : undefined;
+        if (cdTarget !== undefined) {
+          const resolved = await changeRemoteCwd(cdTarget, ctx);
+          return { content: [{ type: "text", text: resolved }], details: { connected: true, cwd: resolved } };
+        }
+        const output = await withReconnect((client) => execRemote(client, `cd -- ${quote(params.cwd ?? state.cwd)} && ${params.remoteCommand}`));
+        const formatted = formatRemoteOutput(output.toString());
+        return { content: [{ type: "text", text: formatted.text }], details: { connected: true, cwd: state.cwd, fullOutputPath: formatted.fullOutputPath } };
+      }
+      const command = params.command || lastCommand || activeSshCommand();
+      if (!command) throw new Error(`No SSH endpoint configured. Set ${REMOTE_CONFIG_FILE} or pass command.`);
+      const state = await connectInteractive(command, ctx, params.cwd ?? configuredCwd(command));
+      if (!state) throw new Error(lastConnectionError || "SSH remote connection was cancelled or failed");
+      return { content: [{ type: "text", text: `Connected: ${state.label}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
+    },
+  });
+
+  pi.registerCommand("remote", {
+    description: "Connect over SSH and manage endpoints: /remote | config | config ssh COMMAND | use USER@HOST:PORT | config cwd PATH | forward [MAPPINGS] | unforward | exec COMMAND | cd PATH | status | reload | off | forget",
+    handler: async (args, ctx) => {
+      const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
+      const action = input.toLowerCase();
+      if (action === "config") {
+        const config = loadRemoteConfig();
+        const rows = Object.entries(config.endpoints ?? {}).map(([key, endpoint]) => {
+          const active = key === config.activeEndpoint ? "*" : " ";
+          return `${active} ${key}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
+        });
+        ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\n${rows.join("\n") || "No saved endpoints"}`, "info");
+        return;
+      }
+      if (/^config\s+ssh\s+/i.test(input)) {
+        const command = input.replace(/^config\s+ssh\s+/i, "").trim();
+        try { parseSshCommand(command); }
+        catch (error) { ctx.ui.notify((error as Error).message, "error"); return; }
+        saveEndpointConfig(command, {}, true);
+        lastCommand = command;
+        ctx.ui.notify(`SSH endpoint saved and selected: ${parseSshCommand(command).label}`, "info");
+        return;
+      }
+      if (/^(?:config\s+)?use\s+/i.test(input)) {
+        const requested = input.replace(/^(?:config\s+)?use\s+/i, "").trim();
+        const config = loadRemoteConfig();
+        const keys = Object.keys(config.endpoints ?? {});
+        const matches = keys.filter((key) => key === requested || key.startsWith(requested));
+        if (matches.length !== 1) {
+          ctx.ui.notify(matches.length ? `Endpoint name is ambiguous: ${matches.join(", ")}` : `Endpoint not found: ${requested}`, "error");
+          return;
+        }
+        const key = matches[0]!;
+        const command = config.endpoints?.[key]?.sshCommand;
+        if (!command) { ctx.ui.notify(`Endpoint has no SSH command: ${key}`, "error"); return; }
+        if (remote && cacheId(remote) !== key) {
+          const previous = remote;
+          remote = null;
+          routeRemoteTools = false;
+          credentialCache.resume = undefined;
+          previous.client.end();
+          await stopForwards();
+          status(ctx);
+        }
+        saveRemoteConfig({ ...config, activeEndpoint: key });
+        lastCommand = command;
+        ctx.ui.notify(`Selected SSH remote endpoint: ${key}; use /remote to connect`, "info");
+        return;
+      }
+      if (/^config\s+cwd\s+/i.test(input)) {
+        const remoteCwd = input.replace(/^config\s+cwd\s+/i, "").trim();
+        const command = lastCommand || activeSshCommand();
+        if (!command) { ctx.ui.notify("Configure an SSH endpoint first", "error"); return; }
+        saveEndpointConfig(command, { remoteCwd });
+        ctx.ui.notify(`Default SSH remote directory updated (${parseSshCommand(command).label}): ${remoteCwd}`, "info");
+        return;
+      }
+      if (/^config\s+forward(?:\s+|$)/i.test(input)) {
+        const forwards = input.replace(/^config\s+forward\s*/i, "").trim().split(/\s+/).filter(Boolean);
+        try { forwards.forEach(parseForwardSpec); }
+        catch (error) { ctx.ui.notify((error as Error).message, "error"); return; }
+        const command = lastCommand || activeSshCommand();
+        if (!command) { ctx.ui.notify("Configure an SSH endpoint first", "error"); return; }
+        saveEndpointConfig(command, { forwards });
+        ctx.ui.notify(`SSH remote port-forward configuration updated (${parseSshCommand(command).label}): ${forwards.join(", ") || "none"}`, "info");
+        return;
+      }
+      if (/^forward(?:\s+|$)/i.test(input)) {
+        try {
+          const state = await ensureConnected(ctx);
+          const supplied = input.replace(/^forward\s*/i, "").trim();
+          const values = supplied ? supplied.split(/\s+/) : configuredForwards(state.command);
+          if (!values.length) throw new Error("No port forwards configured; use /remote config forward LOCAL_PORT:REMOTE_HOST:REMOTE_PORT");
+          const specs = values.map(parseForwardSpec);
+          for (const spec of specs) await startForward(spec);
+          routeRemoteTools = false;
+          status(ctx);
+          ctx.ui.notify(`SSH remote port forwarding started; tools remain local in ${localCwd}: ${specs.map((spec) => `127.0.0.1:${spec.localPort}`).join(", ")}`, "info");
+        } catch (error) { ctx.ui.notify(`SSH remote port forwarding failed: ${(error as Error).message}`, "error"); }
+        return;
+      }
+      if (action === "unforward") {
+        await stopForwards();
+        ctx.ui.notify("Closed all extension-managed SSH remote port forwards", "info");
+        return;
+      }
+      if (/^exec\s+/i.test(input)) {
+        try {
+          const state = await ensureConnected(ctx);
+          const remoteCommand = input.replace(/^exec\s+/i, "");
+          const output = (await withReconnect((client) => execRemote(client, `cd -- ${quote(state.cwd)} && ${remoteCommand}`))).toString().trim();
+          ctx.ui.notify(output.slice(0, 4000) || "SSH remote command completed", "info");
+        } catch (error) { ctx.ui.notify(`SSH remote command failed: ${(error as Error).message}`, "error"); }
+        return;
+      }
+      if (["off", "disconnect", "exit"].includes(action)) { disconnect(ctx); return; }
+      if (action === "forget") { disconnect(ctx, true); return; }
+      if (action === "status") {
+        ctx.ui.notify(remote ? `${remote.label}:${remote.cwd}` : "SSH remote is disconnected", "info");
+        return;
+      }
+      if (["reload", "reconnect"].includes(action)) {
+        try { await reconnectRemote(); }
+        catch (error) { ctx.ui.notify(`SSH remote reconnection failed: ${(error as Error).message}`, "error"); }
+        return;
+      }
+      if (/^cd(?:\s+|$)/i.test(input)) {
+        if (!remote) { ctx.ui.notify("Connect to SSH remote first", "error"); return; }
+        const requested = input.replace(/^cd\s*/i, "").trim() || FALLBACK_REMOTE_CWD;
+        try {
+          const resolved = await changeRemoteCwd(requested, ctx);
+          ctx.ui.notify(`SSH remote path: ${resolved}`, "info");
+        } catch (error) { ctx.ui.notify(`Failed to change SSH remote path: ${(error as Error).message}`, "error"); }
+        return;
+      }
+      const command = input || await ctx.ui.input("SSH command:", lastCommand);
+      if (!command) return;
+      await connectInteractive(command, ctx);
+    },
+  });
+
+  pi.on("session_start", async (event, ctx) => {
+    currentCtx = ctx;
+    status(ctx);
+    if (event.reason === "reload" && credentialCache.resume) {
+      try { await reconnectRemote(); }
+      catch (error) { ctx.ui.notify(`SSH remote automatic login after reload failed: ${(error as Error).message}`, "error"); }
+    }
+  });
+  pi.on("session_shutdown", (event) => {
+    const previous = remote;
+    remote = null;
+    routeRemoteTools = false;
+    void stopForwards();
+    previous?.client.end();
+    if (event.reason !== "reload") credentialCache.resume = undefined;
+  });
+  pi.on("user_bash", async (event, ctx) => {
+    if (!remote || !routeRemoteTools) return undefined;
+    const cdTarget = standaloneCdTarget(event.command);
+    if (cdTarget === undefined) return { operations: remoteBashOps() };
+    try {
+      const resolved = await changeRemoteCwd(cdTarget, ctx);
+      return { result: { output: resolved, exitCode: 0, cancelled: false, truncated: false } };
+    } catch (error) {
+      return { result: { output: (error as Error).message, exitCode: 1, cancelled: false, truncated: false } };
+    }
+  });
+  pi.on("before_agent_start", (event) => remote && routeRemoteTools ? {
+    systemPrompt: event.systemPrompt.replace(
+      `Current working directory: ${localCwd}`,
+      `Current working directory: ${remote.cwd} (via SSH ${remote.label}). All read, write, edit, bash, and user shell operations run on this remote server. Use ssh_remote_control with action disconnect to return to the local environment when requested.`,
+    ),
+  } : undefined);
+}
