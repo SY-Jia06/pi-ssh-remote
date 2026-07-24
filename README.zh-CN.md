@@ -23,6 +23,15 @@ pi install npm:pi-ssh-remote
 /remote off                     # 返回本地工具
 ```
 
+远程命令预览与 Pi 本地 Bash 一致，默认展示最后 5 个视觉行。可以修改默认值，或只覆盖某一次 `/remote exec`：
+
+```text
+/remote config display-lines 10
+/remote exec --lines 20 COMMAND
+```
+
+`ssh_remote_control` 工具的 `exec` 操作也支持 `displayLines`。预览设置只影响折叠界面；提供给模型的输出仍采用 Pi 的 2000 行／50KB 安全限制，超限完整输出会保存到临时文件。
+
 使用 `/remote config` 查看服务器，使用 `/remote` 查看全部子命令。
 
 ## 认证与安全

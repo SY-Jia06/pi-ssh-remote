@@ -23,13 +23,14 @@ import {
   createReadTool,
   createWriteTool,
   formatSize,
+  keyHint,
   truncateTail,
   type BashOperations,
   type EditOperations,
   type ReadOperations,
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, Key, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
 
 interface ParsedSsh {
   host: string;
@@ -58,6 +59,7 @@ interface RemoteEndpointConfig {
 interface RemoteConfig {
   activeEndpoint?: string;
   endpoints?: Record<string, RemoteEndpointConfig>;
+  displayLines?: number;
   /** Legacy fields migrated into endpoints on the next config write. */
   sshCommand?: string;
   remoteCwd?: string;
@@ -74,6 +76,7 @@ const AGENT_DIR = join(process.env.HOME || ".", CONFIG_DIR_NAME, "agent");
 const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
 const REMOTE_CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
 const FALLBACK_REMOTE_CWD = "~";
+const DEFAULT_DISPLAY_LINES = 5;
 const CACHE_KEY = "__piHpcCredentialCacheV1";
 const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
 const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>() };
@@ -151,6 +154,19 @@ function quote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+function parseDisplayLines(value: unknown): number {
+  const lines = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(lines) || lines < 1 || lines > DEFAULT_MAX_LINES) {
+    throw new Error(`Display lines must be an integer from 1 to ${DEFAULT_MAX_LINES}`);
+  }
+  return lines;
+}
+
+function configuredDisplayLines(config = loadRemoteConfig()): number {
+  try { return parseDisplayLines(config.displayLines ?? DEFAULT_DISPLAY_LINES); }
+  catch { return DEFAULT_DISPLAY_LINES; }
+}
+
 function commandFromEndpointKey(key: string): string | undefined {
   const match = key.match(/^([^@]+)@(.+):(\d+)$/);
   if (!match) return undefined;
@@ -182,10 +198,14 @@ function normalizeRemoteConfig(config: RemoteConfig): RemoteConfig {
   }
   if (activeEndpoint && !endpoints[activeEndpoint]) activeEndpoint = undefined;
   activeEndpoint ??= Object.keys(endpoints)[0];
+  let displayLines: number | undefined;
+  try { displayLines = config.displayLines === undefined ? undefined : parseDisplayLines(config.displayLines); }
+  catch { displayLines = undefined; }
 
   return {
     ...(activeEndpoint ? { activeEndpoint } : {}),
     ...(Object.keys(endpoints).length ? { endpoints } : {}),
+    ...(displayLines !== undefined ? { displayLines } : {}),
   };
 }
 
@@ -241,15 +261,54 @@ function displayFingerprint(hex: string): string {
   return `SHA256:${Buffer.from(hex, "hex").toString("base64").replace(/=+$/, "")}`;
 }
 
-function formatRemoteOutput(output: string): { text: string; fullOutputPath?: string } {
-  const truncated = truncateTail(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-  if (!truncated.truncated) return { text: truncated.content || "Remote command completed." };
+function formatRemoteOutput(output: string) {
+  const truncation = truncateTail(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+  const content = truncation.content || "Remote command completed.";
+  if (!truncation.truncated) return { text: content, content, truncation };
 
   const outputDir = mkdtempSync(join(tmpdir(), "pi-ssh-remote-output-"));
   const fullOutputPath = join(outputDir, "output.log");
   writeFileSync(fullOutputPath, output, { encoding: "utf8", mode: 0o600 });
-  const text = `${truncated.content}\n\n[Output truncated: ${truncated.outputLines} of ${truncated.totalLines} lines (${formatSize(truncated.outputBytes)} of ${formatSize(truncated.totalBytes)}). Full output saved locally to: ${fullOutputPath}]`;
-  return { text, fullOutputPath };
+  const startLine = truncation.totalLines - truncation.outputLines + 1;
+  const limit = truncation.truncatedBy === "bytes" ? ` (${formatSize(DEFAULT_MAX_BYTES)} limit)` : "";
+  const text = `${content}\n\n[Showing lines ${startLine}-${truncation.totalLines} of ${truncation.totalLines}${limit}. Full output: ${fullOutputPath}]`;
+  return { text, content, truncation, fullOutputPath };
+}
+
+function previewRemoteOutput(output: string, displayLines: number): string {
+  return truncateTail(output, { maxLines: displayLines, maxBytes: DEFAULT_MAX_BYTES }).content || "Remote command completed.";
+}
+
+function renderRemoteControlResult(result: any, expanded: boolean, theme: any): Component {
+  const fallback = result.content?.find((item: any) => item.type === "text")?.text ?? "";
+  const details = result.details;
+  if (details?.action !== "exec") return new Text(fallback, 0, 0);
+
+  const output = details.output || fallback;
+  const displayLines = details.displayLines || DEFAULT_DISPLAY_LINES;
+  const warnings = [
+    ...(details.fullOutputPath ? [`Full output: ${details.fullOutputPath}`] : []),
+    ...(details.truncation?.truncated ? [`Truncated: showing ${details.truncation.outputLines} of ${details.truncation.totalLines} lines`] : []),
+  ];
+  const warning = warnings.length ? warnings.join(". ") : undefined;
+
+  if (expanded) {
+    return new Text(`${output}${warning ? `\n${theme.fg("warning", `[${warning}]`)}` : ""}`, 0, 0);
+  }
+
+  return {
+    render(width: number) {
+      const styled = output.split("\n").map((line: string) => theme.fg("toolOutput", line)).join("\n");
+      const visualLines = new Text(styled, 0, 0).render(width);
+      const shown = visualLines.slice(-displayLines);
+      const skipped = visualLines.length - shown.length;
+      const hint = skipped > 0
+        ? [theme.fg("muted", `... (${skipped} earlier lines, ${keyHint("app.tools.expand", "to expand")})`)]
+        : [];
+      return [...hint, ...shown, ...(warning ? [theme.fg("warning", `[${warning}]`)] : [])];
+    },
+    invalidate() {},
+  };
 }
 
 function probeFingerprint(config: ParsedSsh): Promise<string> {
@@ -664,7 +723,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "ssh_remote_control",
     label: "SSH Remote Control",
-    description: "Connect, reconnect, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Passwords are never accepted as arguments and are cached only in process memory. Command output is limited to 50KB or 2000 lines; truncated output is saved to a local temporary file.",
+    description: "Connect, reconnect, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Exec output uses a configurable collapsed preview (5 visual lines by default), while model output is limited to 50KB or 2000 lines and saved to a local temporary file when truncated. Passwords are never accepted as arguments and are cached only in process memory.",
     promptSnippet: "Control the configured remote SSH connection, working directory, and local port forwarding",
     promptGuidelines: [
       "Use ssh_remote_control when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
@@ -677,6 +736,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
       remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
+      displayLines: Type.Optional(Type.Integer({ minimum: 1, maximum: DEFAULT_MAX_LINES, description: "Collapsed visual lines for exec output; defaults to the /remote config display-lines setting (5 initially)" })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       if (params.action === "status") {
@@ -722,9 +782,21 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           const resolved = await changeRemoteCwd(cdTarget, ctx);
           return { content: [{ type: "text", text: resolved }], details: { connected: true, cwd: resolved } };
         }
+        const displayLines = parseDisplayLines(params.displayLines ?? configuredDisplayLines());
         const output = await withReconnect((client) => execRemote(client, `cd -- ${quote(params.cwd ?? state.cwd)} && ${params.remoteCommand}`));
         const formatted = formatRemoteOutput(output.toString());
-        return { content: [{ type: "text", text: formatted.text }], details: { connected: true, cwd: state.cwd, fullOutputPath: formatted.fullOutputPath } };
+        return {
+          content: [{ type: "text", text: formatted.text }],
+          details: {
+            action: "exec",
+            connected: true,
+            cwd: state.cwd,
+            displayLines,
+            output: formatted.content,
+            truncation: formatted.truncation.truncated ? formatted.truncation : undefined,
+            fullOutputPath: formatted.fullOutputPath,
+          },
+        };
       }
       const command = params.command || lastCommand || activeSshCommand();
       if (!command) throw new Error(`No SSH endpoint configured. Set ${REMOTE_CONFIG_FILE} or pass command.`);
@@ -732,10 +804,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (!state) throw new Error(lastConnectionError || "SSH remote connection was cancelled or failed");
       return { content: [{ type: "text", text: `Connected: ${state.label}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
     },
+    renderResult(result, { expanded }, theme) {
+      return renderRemoteControlResult(result, expanded, theme);
+    },
   });
 
   pi.registerCommand("remote", {
-    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config cwd PATH | forward [MAPPINGS] | unforward | exec COMMAND | cd PATH | status | reload | off | forget",
+    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config cwd PATH | config display-lines N | forward [MAPPINGS] | unforward | exec [--lines N] COMMAND | cd PATH | status | reload | off | forget",
     handler: async (args, ctx) => {
       const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
       const action = input.toLowerCase();
@@ -745,7 +820,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           const active = key === config.activeEndpoint ? "*" : " ";
           return `${active} ${key}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
         });
-        ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\n${rows.join("\n") || "No saved endpoints"}`, "info");
+        ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
         return;
       }
       if (/^ssh\s+/i.test(input)) {
@@ -782,6 +857,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         saveRemoteConfig({ ...config, activeEndpoint: key });
         lastCommand = command;
         ctx.ui.notify(`Selected SSH remote endpoint: ${key}; use /remote to connect`, "info");
+        return;
+      }
+      if (/^config\s+display-lines\s+/i.test(input)) {
+        try {
+          const displayLines = parseDisplayLines(input.replace(/^config\s+display-lines\s+/i, "").trim());
+          saveRemoteConfig({ ...loadRemoteConfig(), displayLines });
+          ctx.ui.notify(`SSH remote command preview updated: ${displayLines} lines`, "info");
+        } catch (error) { ctx.ui.notify((error as Error).message, "error"); }
         return;
       }
       if (/^config\s+cwd\s+/i.test(input)) {
@@ -824,9 +907,18 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (/^exec\s+/i.test(input)) {
         try {
           const state = await ensureConnected(ctx);
-          const remoteCommand = input.replace(/^exec\s+/i, "");
+          const execInput = input.replace(/^exec\s+/i, "");
+          const linesMatch = execInput.match(/^--lines\s+(\S+)\s+([\s\S]+)$/i);
+          const displayLines = linesMatch ? parseDisplayLines(linesMatch[1]) : configuredDisplayLines();
+          const remoteCommand = linesMatch ? linesMatch[2]! : execInput;
           const output = (await withReconnect((client) => execRemote(client, `cd -- ${quote(state.cwd)} && ${remoteCommand}`))).toString().trim();
-          ctx.ui.notify(output.slice(0, 4000) || "SSH remote command completed", "info");
+          const formatted = formatRemoteOutput(output);
+          const preview = previewRemoteOutput(formatted.content, displayLines);
+          const omitted = formatted.truncation.totalLines > displayLines
+            ? `\n\n[Showing last ${Math.min(displayLines, formatted.truncation.totalLines)} of ${formatted.truncation.totalLines} lines]`
+            : "";
+          const fullOutput = formatted.fullOutputPath ? `\n[Full output: ${formatted.fullOutputPath}]` : "";
+          ctx.ui.notify(`${preview}${omitted}${fullOutput}`, "info");
         } catch (error) { ctx.ui.notify(`SSH remote command failed: ${(error as Error).message}`, "error"); }
         return;
       }

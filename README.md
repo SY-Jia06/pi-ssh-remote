@@ -23,6 +23,15 @@ pi install npm:pi-ssh-remote
 /remote off                     # return to local tools
 ```
 
+Remote command previews follow Pi's local Bash behavior and show the last 5 visual lines by default. Configure the default or override one `/remote exec` invocation:
+
+```text
+/remote config display-lines 10
+/remote exec --lines 20 COMMAND
+```
+
+The `ssh_remote_control` tool's `exec` action also accepts `displayLines`. Preview settings affect only the collapsed UI; model output keeps Pi's 2000-line/50KB safety limits, with oversized output saved to a temporary file.
+
 Run `/remote config` to list endpoints and `/remote` to see all available subcommands.
 
 ## Authentication and security
