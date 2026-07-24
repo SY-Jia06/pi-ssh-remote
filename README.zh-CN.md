@@ -17,7 +17,7 @@ pi install npm:pi-ssh-remote
 ## 使用
 
 ```text
-/remote ssh USER@HOST -p PORT  # 保存并连接
+/remote ssh root@xx.xx.xx.xx -p xxxx  # 保存并连接
 /remote cd /remote/project
 /remote status
 /remote off                     # 返回本地工具
