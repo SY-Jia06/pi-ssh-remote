@@ -542,7 +542,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (remote) return remote;
     if (credentialCache.resume) return reconnectRemote();
     const command = lastCommand || activeSshCommand();
-    if (!command) throw new Error("No SSH endpoint configured; use /remote config ssh ssh USER@HOST -p PORT");
+    if (!command) throw new Error("No SSH endpoint configured; use /remote ssh USER@HOST -p PORT");
     const state = await connectInteractive(command, ctx, configuredCwd(command));
     if (!state) throw new Error("SSH remote connection was cancelled or failed");
     return state;
@@ -735,7 +735,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("remote", {
-    description: "Connect over SSH and manage endpoints: /remote | config | config ssh COMMAND | use USER@HOST:PORT | config cwd PATH | forward [MAPPINGS] | unforward | exec COMMAND | cd PATH | status | reload | off | forget",
+    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config cwd PATH | forward [MAPPINGS] | unforward | exec COMMAND | cd PATH | status | reload | off | forget",
     handler: async (args, ctx) => {
       const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
       const action = input.toLowerCase();
@@ -748,13 +748,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\n${rows.join("\n") || "No saved endpoints"}`, "info");
         return;
       }
-      if (/^config\s+ssh\s+/i.test(input)) {
-        const command = input.replace(/^config\s+ssh\s+/i, "").trim();
+      if (/^ssh\s+/i.test(input)) {
+        const sshArguments = input.replace(/^ssh\s+/i, "").trim();
+        const command = `ssh ${sshArguments}`;
         try { parseSshCommand(command); }
         catch (error) { ctx.ui.notify((error as Error).message, "error"); return; }
         saveEndpointConfig(command, {}, true);
         lastCommand = command;
-        ctx.ui.notify(`SSH endpoint saved and selected: ${parseSshCommand(command).label}`, "info");
+        await connectInteractive(command, ctx);
         return;
       }
       if (/^(?:config\s+)?use\s+/i.test(input)) {
