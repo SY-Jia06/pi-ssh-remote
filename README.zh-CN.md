@@ -25,6 +25,13 @@ pi install npm:pi-ssh-remote
 
 连接后，Pi 底部状态栏会显示远程地址和当前工作目录，例如 `SSH remote user@host:22:/remote/project`。切换目录或重连后会自动更新，断开连接后则会消失。
 
+可以为当前选中的服务器添加备注，方便在 `/remote config`、状态栏和状态消息中识别；使用 `--clear` 清除：
+
+```text
+/remote config note GPU 训练服务器
+/remote config note --clear
+```
+
 远程命令预览与 Pi 本地 Bash 一致，默认展示最后 5 个视觉行。可以修改默认值，或只覆盖某一次 `/remote exec`：
 
 ```text

@@ -25,6 +25,13 @@ pi install npm:pi-ssh-remote
 
 While connected, Pi's footer status displays the remote endpoint and current working directory, for example `SSH remote user@host:22:/remote/project`. It updates after changing directories or reconnecting and disappears after disconnecting.
 
+Add a note to the selected endpoint to make it easier to identify in `/remote config`, the footer, and status messages. Clear it with `--clear`:
+
+```text
+/remote config note GPU training server
+/remote config note --clear
+```
+
 Remote command previews follow Pi's local Bash behavior and show the last 5 visual lines by default. Configure the default or override one `/remote exec` invocation:
 
 ```text

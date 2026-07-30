@@ -54,6 +54,7 @@ interface RemoteEndpointConfig {
   sshCommand?: string;
   remoteCwd?: string;
   forwards?: string[];
+  note?: string;
 }
 
 interface RemoteConfig {
@@ -244,6 +245,11 @@ function activeEndpointConfig(config: RemoteConfig): RemoteEndpointConfig | unde
 
 function activeSshCommand(config = loadRemoteConfig()): string | undefined {
   return activeEndpointConfig(config)?.sshCommand;
+}
+
+function endpointDisplayLabel(endpoint: ParsedSsh, config = loadRemoteConfig()): string {
+  const note = endpointConfig(config, endpoint.command).note?.trim();
+  return note ? `${note} (${endpoint.label})` : endpoint.label;
 }
 
 function saveEndpointConfig(command: string, updates: RemoteEndpointConfig, makeActive = false): void {
@@ -474,8 +480,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const status = (ctx: any) => {
     currentCtx = ctx;
     if (!remote) ctx.ui.setStatus("ssh-remote", undefined);
-    else if (routeRemoteTools) ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH remote ${remote.label}:${remote.cwd}`));
-    else ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH remote tunnel ${[...forwardServers.keys()].join(",") || remote.label}`));
+    else if (routeRemoteTools) ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH remote ${endpointDisplayLabel(remote)}:${remote.cwd}`));
+    else ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH remote tunnel ${[...forwardServers.keys()].join(",") || endpointDisplayLabel(remote)}`));
   };
 
   const attachClient = (state: RemoteState) => {
@@ -483,7 +489,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     client.on("close", () => {
       if (remote?.client !== client) return;
       if (currentCtx) {
-        currentCtx.ui.setStatus("ssh-remote", currentCtx.ui.theme.fg("warning", `SSH remote reconnecting ${state.label}…`));
+        currentCtx.ui.setStatus("ssh-remote", currentCtx.ui.theme.fg("warning", `SSH remote reconnecting ${endpointDisplayLabel(state)}…`));
       }
       void reconnectRemote().catch((error) => {
         if (currentCtx) currentCtx.ui.notify(`SSH remote automatic reconnection failed: ${(error as Error).message}`, "error");
@@ -522,7 +528,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       oldClient?.end();
       if (currentCtx) {
         status(currentCtx);
-        currentCtx.ui.notify(`SSH remote reconnected automatically: ${next.label}:${next.cwd}`, "info");
+        currentCtx.ui.notify(`SSH remote reconnected automatically: ${endpointDisplayLabel(next)}:${next.cwd}`, "info");
       }
       return next;
     })().finally(() => { reconnectPromise = null; });
@@ -592,7 +598,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
 
     let password = getCachedPassword(parsed);
-    ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `SSH remote connecting ${parsed.label}…`));
+    ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `SSH remote connecting ${endpointDisplayLabel(parsed)}…`));
     try {
       let next: RemoteState;
       try {
@@ -617,7 +623,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       lastConnectionError = undefined;
       saveEndpointConfig(command, { remoteCwd: next.cwd }, true);
       status(ctx);
-      ctx.ui.notify(`SSH remote connected: ${parsed.label}:${next.cwd}`, "info");
+      ctx.ui.notify(`SSH remote connected: ${endpointDisplayLabel(next)}:${next.cwd}`, "info");
       return next;
     } catch (error) {
       deleteCachedPassword(parsed);
@@ -753,8 +759,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "ssh_remote_control",
     label: "SSH Remote Control",
-    description: "Connect, reconnect, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Exec output uses a configurable collapsed preview (5 visual lines by default), while model output is limited to 50KB or 2000 lines and saved to a local temporary file when truncated. Passwords are never accepted as arguments and are cached only in process memory.",
-    promptSnippet: "Control the configured remote SSH connection, working directory, and local port forwarding",
+    description: "Connect, reconnect, annotate endpoints, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Exec output uses a configurable collapsed preview (5 visual lines by default), while model output is limited to 50KB or 2000 lines and saved to a local temporary file when truncated. Passwords are never accepted as arguments and are cached only in process memory.",
+    promptSnippet: "Control the configured remote SSH connection, endpoint note, working directory, and local port forwarding",
     promptGuidelines: [
       "Use ssh_remote_control when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
       "Use ssh_remote_control with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
@@ -762,8 +768,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       "Use ssh_remote_control with action disconnect after remote work when the user asks to return to the local environment.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir"] as const),
-      command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22" })),
+      action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note"] as const),
+      command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22; optionally selects the endpoint for note" })),
+      note: Type.Optional(Type.String({ description: "Endpoint note for the note action; omit or use an empty string to clear it" })),
       cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
       remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
@@ -773,7 +780,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     async execute(_id, params, _signal, _update, ctx) {
       if (params.action === "status") {
         const mappings = [...forwardServers.keys()].sort((a, b) => a - b);
-        const text = `${remote ? `Connected: ${remote.label}:${remote.cwd}; tool routing: ${routeRemoteTools ? "remote" : "local"}` : "SSH remote is disconnected"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}`;
+        const text = `${remote ? `Connected: ${endpointDisplayLabel(remote)}:${remote.cwd}; tool routing: ${routeRemoteTools ? "remote" : "local"}` : "SSH remote is disconnected"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}`;
         return { content: [{ type: "text", text }], details: { connected: Boolean(remote), cwd: remote?.cwd, toolRouting: routeRemoteTools ? "remote" : "local", forwardedPorts: mappings } };
       }
       if (params.action === "disconnect" || params.action === "forget") {
@@ -783,7 +790,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (params.action === "reconnect") {
         if (!remote && !credentialCache.resume) throw new Error("No SSH remote connection is available to reconnect");
         const state = await reconnectRemote();
-        return { content: [{ type: "text", text: `Reconnected: ${state.label}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
+        return { content: [{ type: "text", text: `Reconnected: ${endpointDisplayLabel(state)}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
       }
       if (params.action === "unforward") {
         await stopForwards();
@@ -805,6 +812,18 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         if (!params.cwd) throw new Error("cwd is required for chdir");
         const resolved = await changeRemoteCwd(params.cwd, ctx);
         return { content: [{ type: "text", text: `Remote working directory: ${resolved}` }], details: { connected: true, cwd: resolved } };
+      }
+      if (params.action === "note") {
+        const command = params.command || lastCommand || activeSshCommand();
+        if (!command) throw new Error("No SSH endpoint configured; connect or select an endpoint first");
+        const note = params.note?.trim() || undefined;
+        saveEndpointConfig(command, { note });
+        if (remote && cacheId(remote) === cacheId(parseSshCommand(command)) && currentCtx) status(currentCtx);
+        const label = parseSshCommand(command).label;
+        return {
+          content: [{ type: "text", text: note ? `SSH remote note updated (${label}): ${note}` : `SSH remote note cleared (${label})` }],
+          details: { endpoint: label, note },
+        };
       }
       if (params.action === "exec") {
         const state = await ensureConnected(ctx);
@@ -840,7 +859,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (!command) throw new Error(`No SSH endpoint configured. Set ${REMOTE_CONFIG_FILE} or pass command.`);
       const state = await connectInteractive(command, ctx, params.cwd ?? configuredCwd(command));
       if (!state) throw new Error(lastConnectionError || "SSH remote connection was cancelled or failed");
-      return { content: [{ type: "text", text: `Connected: ${state.label}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
+      return { content: [{ type: "text", text: `Connected: ${endpointDisplayLabel(state)}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
     },
     renderResult(result, { expanded }, theme) {
       return renderRemoteControlResult(result, expanded, theme);
@@ -848,7 +867,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("remote", {
-    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config cwd PATH | config display-lines N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
+    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config note TEXT|--clear | config cwd PATH | config display-lines N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
     handler: async (args, ctx) => {
       const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
       const action = input.toLowerCase();
@@ -856,7 +875,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const config = loadRemoteConfig();
         const rows = Object.entries(config.endpoints ?? {}).map(([key, endpoint]) => {
           const active = key === config.activeEndpoint ? "*" : " ";
-          return `${active} ${key}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
+          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
         });
         ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
         return;
@@ -895,6 +914,17 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         saveRemoteConfig({ ...config, activeEndpoint: key });
         lastCommand = command;
         ctx.ui.notify(`Selected SSH remote endpoint: ${key}; use /remote to connect`, "info");
+        return;
+      }
+      if (/^config\s+note(?:\s+|$)/i.test(input)) {
+        const value = input.replace(/^config\s+note\s*/i, "").trim();
+        if (!value) { ctx.ui.notify("Use /remote config note TEXT or /remote config note --clear", "error"); return; }
+        const command = lastCommand || activeSshCommand();
+        if (!command) { ctx.ui.notify("Configure an SSH endpoint first", "error"); return; }
+        const note = value.toLowerCase() === "--clear" ? undefined : value;
+        saveEndpointConfig(command, { note });
+        if (remote && cacheId(remote) === cacheId(parseSshCommand(command))) status(ctx);
+        ctx.ui.notify(note ? `SSH remote note updated (${parseSshCommand(command).label}): ${note}` : `SSH remote note cleared (${parseSshCommand(command).label})`, "info");
         return;
       }
       if (/^config\s+display-lines\s+/i.test(input)) {
@@ -974,7 +1004,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (["off", "disconnect", "exit"].includes(action)) { disconnect(ctx); return; }
       if (action === "forget") { disconnect(ctx, true); return; }
       if (action === "status") {
-        ctx.ui.notify(remote ? `${remote.label}:${remote.cwd}` : "SSH remote is disconnected", "info");
+        ctx.ui.notify(remote ? `${endpointDisplayLabel(remote)}:${remote.cwd}` : "SSH remote is disconnected", "info");
         return;
       }
       if (["reload", "reconnect"].includes(action)) {
@@ -1027,7 +1057,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.on("before_agent_start", (event) => remote && routeRemoteTools ? {
     systemPrompt: event.systemPrompt.replace(
       `Current working directory: ${localCwd}`,
-      `Current working directory: ${remote.cwd} (via SSH ${remote.label}). All read, write, edit, bash, and user shell operations run on this remote server. Use ssh_remote_control with action disconnect to return to the local environment when requested.`,
+      `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All read, write, edit, bash, and user shell operations run on this remote server. Use ssh_remote_control with action disconnect to return to the local environment when requested.`,
     ),
   } : undefined);
 }
