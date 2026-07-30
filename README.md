@@ -1,12 +1,56 @@
 <!--
-Concise English documentation for pi-ssh-remote, covering its purpose, installation, essential commands, authentication, and security boundaries.
+Agent-first English documentation for pi-ssh-remote. It explains the extension's design, transparent tool routing, persistent workspace model, safety boundaries, compelling workflows, commands, and installation requirements.
 -->
 
 # pi-ssh-remote
 
+**SSH designed for agents—not just for terminals.**
+
 [中文文档](README.zh-CN.md) · [Community](https://linux.do/)
 
-Use Pi's file and shell tools on a persistent remote SSH workspace. Supports multiple endpoints, remote working directories, reconnection, and local port forwarding.
+`pi-ssh-remote` turns a remote machine into Pi's active workspace. After connecting, the agent keeps using its normal `read`, `write`, `edit`, and `bash` tools, but those operations run on the remote server. There is no need to wrap every action in `ssh ...`, copy files back and forth, or make the model reason about two unrelated shells.
+
+```text
+You: Connect to ssh root@gpu-box -p 2202, open /srv/training,
+     find why the latest run failed, fix it, and restart it in the
+     background. Return the PID and log path.
+
+Pi:  connects → changes the persistent remote cwd → reads logs →
+     edits remote files → launches the job on the GPU server
+```
+
+## Designed for agent workflows
+
+### The remote machine becomes the agent's workspace
+
+Once connected, Pi's file tools, shell tool, and `!` user shell commands are transparently routed over SSH. The agent can inspect a repository, search logs, edit code, and run tests with the same tool interface it uses locally.
+
+### Agent control plane, human control plane
+
+The extension exposes `ssh_remote_control` for the agent and `/remote` for the user. You can ask Pi to connect, inspect status, change directory, add a server note, execute a command, create a tunnel, or return to local work in natural language—and still take direct control whenever you want.
+
+### Stateful endpoints instead of disposable SSH commands
+
+Each `user@host:port` endpoint remembers its remote working directory, note, and port-forward configuration locally. Notes such as `H100 training`, `staging`, or `customer demo` appear in configuration, status messages, and Pi's footer, so the active execution environment stays visible.
+
+### Resilient and bounded by default
+
+Dropped connections are automatically re-established during the active session. Remote commands have a 30-second default timeout, oversized output is bounded before it reaches the model context, and full truncated output is preserved in a temporary file.
+
+### Hybrid local/remote workflows
+
+Tunnel mode forwards remote services to localhost while returning Pi's tools to the local machine. This is useful when the backend runs on a GPU server but the client, browser automation, or integration code lives locally.
+
+## Why not just run `ssh` in Bash?
+
+| Plain SSH command | `pi-ssh-remote` |
+|---|---|
+| Each tool call must wrap or reconstruct SSH | All agent file and shell tools route automatically |
+| Working directory is easy to lose between calls | Remote cwd is persistent and visible |
+| The model must track whether it is local or remote | Pi's prompt and footer identify the active workspace |
+| Disconnects break the workflow | Active-session connections automatically reconnect |
+| Tunneling and remote editing are separate setups | Workspace routing and port forwarding share one control plane |
+| Large output can flood context | Preview and model-output limits are built in |
 
 ## Install
 
@@ -14,42 +58,141 @@ Use Pi's file and shell tools on a persistent remote SSH workspace. Supports mul
 pi install npm:pi-ssh-remote
 ```
 
-## Use
+Requires Node.js 20+. The remote server must provide Bash, SFTP, and GNU `timeout`.
+
+## Quick start
 
 ```text
-/remote ssh root@xx.xx.xx.xx -p xxxx  # save and connect
-/remote cd /remote/project
+/remote ssh root@gpu-box.example.com -p 2202
+/remote cd /srv/project
+/remote config note H100 training server
 /remote status
-/remote off                     # return to local tools
 ```
 
-While connected, Pi's footer status displays the remote endpoint and current working directory, for example `SSH remote user@host:22:/remote/project`. It updates after changing directories or reconnecting and disappears after disconnecting.
-
-Add a note to the selected endpoint to make it easier to identify in `/remote config`, the footer, and status messages. Clear it with `--clear`:
+From this point, normal Pi operations target `/srv/project` on the remote server. The footer makes that routing explicit:
 
 ```text
-/remote config note GPU training server
-/remote config note --clear
+SSH remote H100 training server (root@gpu-box.example.com:2202):/srv/project
 ```
 
-Remote command previews follow Pi's local Bash behavior and show the last 5 visual lines by default. Configure the default or override one `/remote exec` invocation:
+Return to local tools with:
 
 ```text
-/remote config display-lines 10
-/remote exec --lines 20 COMMAND
-/remote exec --timeout 60 COMMAND
+/remote off
 ```
 
-Every remote shell command has a timeout. `/remote exec`, remote Bash operations, and the `ssh_remote_control` tool's `exec` action default to 30 seconds when no timeout is supplied. The tool's `exec` action accepts `timeout` and `displayLines` parameters. Preview settings affect only the collapsed UI; model output keeps Pi's 2000-line/50KB safety limits, with oversized output saved to a temporary file.
+## Examples
 
-Run `/remote config` to list endpoints and `/remote` to see all available subcommands.
+### 1. Let the agent investigate and repair a remote failure
 
-## Authentication and security
+```text
+Connect to ssh ubuntu@training.example.com -p 22 and work in /opt/app.
+Inspect the failed deployment, trace the error through the logs and source,
+make the smallest safe fix, run the relevant tests, and show me the diff.
+```
 
-Uses SSH agent authentication when available, otherwise prompts for a password. Passwords stay in process memory. New or changed host keys require confirmation and are stored separately from OpenSSH.
+The connection is established once. Subsequent reads, searches, edits, and tests are ordinary Pi tool calls routed to the server.
 
-Only direct SSH commands with `-p` and `-l` are supported. `~/.ssh/config`, `IdentityFile`, and ProxyJump are not currently supported.
+### 2. Launch a long GPU job without blocking the agent
 
-Requires Node.js 20+, Bash, SFTP, and GNU `timeout` on the remote host.
+```text
+On the current remote server, validate the training command first. Then launch
+it with nohup in the background, redirect stdout and stderr from process start,
+and report the PID, output directory, and log path. Verify that the process is
+still alive and that the log has started.
+```
+
+The default foreground timeout prevents an accidental long-running command from occupying the agent indefinitely, while an explicitly backgrounded job continues on the server.
+
+### 3. Keep several machines understandable
+
+```text
+/remote ssh root@10.0.0.21 -p 22
+/remote config note 8xH100 training
+/remote config cwd /srv/train
+
+/remote ssh ubuntu@staging.example.com -p 2222
+/remote config note staging API
+/remote config cwd /opt/service
+
+/remote config
+/remote use root@10.0.0.21:22
+/remote
+```
+
+Endpoint notes and working directories survive Pi restarts because they are stored in the local remote configuration.
+
+### 4. Expose a remote service while editing locally
+
+```text
+/remote config forward 7860:127.0.0.1:7860
+/remote forward
+```
+
+Now `localhost:7860` reaches the service on the SSH server, while Pi's file and shell tools remain local. This is ideal for a remote model server paired with a local UI or client repository.
+
+Stop the tunnels with:
+
+```text
+/remote unforward
+```
+
+### 5. Ask Pi directly
+
+```text
+Connect to my configured remote, switch to /srv/api, and inspect its Git status.
+```
+
+```text
+Add the note "production read-only" to this endpoint and tell me which remote
+workspace is active.
+```
+
+```text
+Forward the remote service on port 8000 to localhost:8000, but keep my coding
+tools on the local repository.
+```
+
+These requests are handled through the agent-facing `ssh_remote_control` tool; slash commands are optional.
+
+## Command reference
+
+| Command | Purpose |
+|---|---|
+| `/remote ssh USER@HOST -p PORT` | Save, select, and connect to an endpoint |
+| `/remote` | Connect to the selected endpoint or prompt for one |
+| `/remote config` | List saved endpoints and settings |
+| `/remote use USER@HOST:PORT` | Select a saved endpoint |
+| `/remote config note TEXT` | Persist a note for the selected endpoint |
+| `/remote config note --clear` | Clear its note |
+| `/remote config cwd PATH` | Persist its default remote working directory |
+| `/remote cd PATH` | Change the connected remote cwd and persist it |
+| `/remote config forward MAPPING...` | Persist port forwards such as `7860:127.0.0.1:7860` |
+| `/remote forward [MAPPING...]` | Start tunnels and keep Pi's tools local |
+| `/remote unforward` | Stop extension-managed tunnels |
+| `/remote exec COMMAND` | Run one command in the remote cwd |
+| `/remote exec --timeout 60 COMMAND` | Override the command timeout |
+| `/remote exec --lines 20 COMMAND` | Override collapsed preview lines |
+| `/remote config display-lines 10` | Set default collapsed preview lines |
+| `/remote status` | Show the active workspace |
+| `/remote reload` | Reconnect the active workspace |
+| `/remote off` | Disconnect and return tools to local execution |
+| `/remote forget` | Disconnect and clear the in-memory password |
+
+## Persistence, output, and security
+
+Endpoint configuration is stored locally in:
+
+```text
+~/.pi/agent/ssh-remote-config.json
+```
+
+Saved values include endpoints, active endpoint, notes, remote working directories, forwards, and preview settings. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
+
+New or changed host keys require interactive confirmation and are stored separately from OpenSSH. Remote output sent to the model is limited to 2,000 lines or 50 KB; oversized complete output is written to a temporary local file. Preview-line settings affect only the collapsed UI.
+
+## Current SSH scope
+
+The extension currently supports direct SSH commands with `-p` and `-l`. It does not yet consume `~/.ssh/config`, `IdentityFile`, or ProxyJump settings.
 
 MIT licensed.
