@@ -30,9 +30,10 @@ pi install npm:pi-ssh-remote
 ```text
 /remote config display-lines 10
 /remote exec --lines 20 COMMAND
+/remote exec --timeout 60 COMMAND
 ```
 
-`ssh_remote_control` 工具的 `exec` 操作也支持 `displayLines`。预览设置只影响折叠界面；提供给模型的输出仍采用 Pi 的 2000 行／50KB 安全限制，超限完整输出会保存到临时文件。
+所有远程 Shell 命令都有超时限制。若未提供 timeout，`/remote exec`、远程 Bash 操作以及 `ssh_remote_control` 工具的 `exec` 操作均默认使用 30 秒。工具的 `exec` 操作支持 `timeout` 和 `displayLines` 参数。预览设置只影响折叠界面；提供给模型的输出仍采用 Pi 的 2000 行／50KB 安全限制，超限完整输出会保存到临时文件。
 
 使用 `/remote config` 查看服务器，使用 `/remote` 查看全部子命令。
 

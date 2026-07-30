@@ -30,9 +30,10 @@ Remote command previews follow Pi's local Bash behavior and show the last 5 visu
 ```text
 /remote config display-lines 10
 /remote exec --lines 20 COMMAND
+/remote exec --timeout 60 COMMAND
 ```
 
-The `ssh_remote_control` tool's `exec` action also accepts `displayLines`. Preview settings affect only the collapsed UI; model output keeps Pi's 2000-line/50KB safety limits, with oversized output saved to a temporary file.
+Every remote shell command has a timeout. `/remote exec`, remote Bash operations, and the `ssh_remote_control` tool's `exec` action default to 30 seconds when no timeout is supplied. The tool's `exec` action accepts `timeout` and `displayLines` parameters. Preview settings affect only the collapsed UI; model output keeps Pi's 2000-line/50KB safety limits, with oversized output saved to a temporary file.
 
 Run `/remote config` to list endpoints and `/remote` to see all available subcommands.
 

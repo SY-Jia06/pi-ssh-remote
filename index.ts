@@ -77,6 +77,8 @@ const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
 const REMOTE_CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
 const FALLBACK_REMOTE_CWD = "~";
 const DEFAULT_DISPLAY_LINES = 5;
+const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
+const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
 const CACHE_KEY = "__piHpcCredentialCacheV1";
 const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
 const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>() };
@@ -160,6 +162,18 @@ function parseDisplayLines(value: unknown): number {
     throw new Error(`Display lines must be an integer from 1 to ${DEFAULT_MAX_LINES}`);
   }
   return lines;
+}
+
+function parseRemoteTimeout(value: unknown): number {
+  const seconds = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0 || seconds > MAX_REMOTE_TIMEOUT_SECONDS) {
+    throw new Error(`Timeout must be a positive number no greater than ${MAX_REMOTE_TIMEOUT_SECONDS} seconds`);
+  }
+  return seconds;
+}
+
+function withRemoteTimeout(command: string, timeoutSeconds: number): string {
+  return `timeout --signal=TERM --kill-after=5s ${timeoutSeconds}s bash -lc ${quote(command)}`;
 }
 
 function configuredDisplayLines(config = loadRemoteConfig()): number {
@@ -357,16 +371,34 @@ function connect(config: ParsedSsh, password: string | undefined, fingerprint: s
   });
 }
 
-function execRemote(client: Client, command: string, allowFailure = false): Promise<Buffer> {
+function execRemote(
+  client: Client,
+  command: string,
+  allowFailure = false,
+  timeoutSeconds = DEFAULT_REMOTE_TIMEOUT_SECONDS,
+): Promise<Buffer> {
+  const resolvedTimeout = parseRemoteTimeout(timeoutSeconds);
   return new Promise((resolve, reject) => {
-    client.exec(command, (error, stream) => {
+    client.exec(withRemoteTimeout(command, resolvedTimeout), (error, stream) => {
       if (error) return reject(error);
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
+      let locallyTimedOut = false;
+      const timer = setTimeout(() => {
+        locallyTimedOut = true;
+        stream.close();
+      }, (resolvedTimeout + 8) * 1000);
+      const cleanup = () => clearTimeout(timer);
       stream.on("data", (chunk: Buffer) => stdout.push(chunk));
       stream.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      stream.once("error", (streamError: Error) => {
+        cleanup();
+        reject(streamError);
+      });
       stream.on("close", (code: number | null) => {
-        if (!allowFailure && code !== 0) reject(new Error(Buffer.concat(stderr).toString().trim() || `Remote command exited with code ${code}`));
+        cleanup();
+        if (locallyTimedOut || code === 124 || code === 137) reject(new Error(`Remote command timed out after ${resolvedTimeout} seconds`));
+        else if (!allowFailure && code !== 0) reject(new Error(Buffer.concat(stderr).toString().trim() || `Remote command exited with code ${code}`));
         else resolve(Buffer.concat(stdout));
       });
     });
@@ -688,23 +720,21 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   const remoteBashOps = (): BashOperations => ({
     exec: (command, cwd, { onData, signal, timeout }) => new Promise((resolve, reject) => {
-      const timeoutSeconds = timeout ? Math.max(1, Math.ceil(timeout)) : undefined;
-      const remoteCommand = timeoutSeconds
-        ? `timeout --signal=TERM --kill-after=5s ${timeoutSeconds}s bash -lc ${quote(command)}`
-        : command;
+      const timeoutSeconds = parseRemoteTimeout(timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
+      const remoteCommand = withRemoteTimeout(command, timeoutSeconds);
       const full = `cd -- ${quote(mapPath(cwd))} && ${remoteCommand}`;
       void openExecChannel(full).then((stream) => {
         let timedOut = false;
-        const timer = timeoutSeconds ? setTimeout(() => { timedOut = true; stream.close(); }, (timeoutSeconds + 8) * 1000) : undefined;
+        const timer = setTimeout(() => { timedOut = true; stream.close(); }, (timeoutSeconds + 8) * 1000);
         const abort = () => stream.close();
         signal?.addEventListener("abort", abort, { once: true });
         stream.on("data", onData);
         stream.stderr.on("data", onData);
         stream.on("close", (code: number | null) => {
-          if (timer) clearTimeout(timer);
+          clearTimeout(timer);
           signal?.removeEventListener("abort", abort);
           if (signal?.aborted) reject(new Error("aborted"));
-          else if (timedOut || code === 124) reject(new Error(`timeout:${timeoutSeconds}`));
+          else if (timedOut || code === 124 || code === 137) reject(new Error(`timeout:${timeoutSeconds}`));
           else resolve({ exitCode: code });
         });
       }, reject);
@@ -728,6 +758,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use ssh_remote_control when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
       "Use ssh_remote_control with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
+      `Always set timeout for ssh_remote_control remote exec commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
       "Use ssh_remote_control with action disconnect after remote work when the user asks to return to the local environment.",
     ],
     parameters: Type.Object({
@@ -736,6 +767,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
       remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
+      timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_REMOTE_TIMEOUT_SECONDS, description: `Remote command timeout in seconds; defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS}` })),
       displayLines: Type.Optional(Type.Integer({ minimum: 1, maximum: DEFAULT_MAX_LINES, description: "Collapsed visual lines for exec output; defaults to the /remote config display-lines setting (5 initially)" })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
@@ -783,7 +815,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text", text: resolved }], details: { connected: true, cwd: resolved } };
         }
         const displayLines = parseDisplayLines(params.displayLines ?? configuredDisplayLines());
-        const output = await withReconnect((client) => execRemote(client, `cd -- ${quote(params.cwd ?? state.cwd)} && ${params.remoteCommand}`));
+        const timeoutSeconds = parseRemoteTimeout(params.timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
+        const output = await withReconnect((client) => execRemote(
+          client,
+          `cd -- ${quote(params.cwd ?? state.cwd)} && ${params.remoteCommand}`,
+          false,
+          timeoutSeconds,
+        ));
         const formatted = formatRemoteOutput(output.toString());
         return {
           content: [{ type: "text", text: formatted.text }],
@@ -810,7 +848,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("remote", {
-    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config cwd PATH | config display-lines N | forward [MAPPINGS] | unforward | exec [--lines N] COMMAND | cd PATH | status | reload | off | forget",
+    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config cwd PATH | config display-lines N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
     handler: async (args, ctx) => {
       const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
       const action = input.toLowerCase();
@@ -907,11 +945,22 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (/^exec\s+/i.test(input)) {
         try {
           const state = await ensureConnected(ctx);
-          const execInput = input.replace(/^exec\s+/i, "");
-          const linesMatch = execInput.match(/^--lines\s+(\S+)\s+([\s\S]+)$/i);
-          const displayLines = linesMatch ? parseDisplayLines(linesMatch[1]) : configuredDisplayLines();
-          const remoteCommand = linesMatch ? linesMatch[2]! : execInput;
-          const output = (await withReconnect((client) => execRemote(client, `cd -- ${quote(state.cwd)} && ${remoteCommand}`))).toString().trim();
+          let execInput = input.replace(/^exec\s+/i, "").trim();
+          let displayLines = configuredDisplayLines();
+          let timeoutSeconds = DEFAULT_REMOTE_TIMEOUT_SECONDS;
+          while (execInput.startsWith("--")) {
+            const option = execInput.match(/^--(lines|timeout)\s+(\S+)\s+([\s\S]+)$/i);
+            if (!option) throw new Error("Expected --lines N or --timeout SECONDS followed by a command");
+            if (option[1]!.toLowerCase() === "lines") displayLines = parseDisplayLines(option[2]);
+            else timeoutSeconds = parseRemoteTimeout(option[2]);
+            execInput = option[3]!;
+          }
+          const output = (await withReconnect((client) => execRemote(
+            client,
+            `cd -- ${quote(state.cwd)} && ${execInput}`,
+            false,
+            timeoutSeconds,
+          ))).toString().trim();
           const formatted = formatRemoteOutput(output);
           const preview = previewRemoteOutput(formatted.content, displayLines);
           const omitted = formatted.truncation.totalLines > displayLines
