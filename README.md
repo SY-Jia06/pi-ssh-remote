@@ -31,7 +31,7 @@ The extension exposes `ssh_remote_control` for the agent and `/remote` for the u
 
 ### Stateful endpoints instead of disposable SSH commands
 
-Each `user@host:port` endpoint remembers its remote working directory, note, and port-forward configuration locally. Notes such as `H100 training`, `staging`, or `customer demo` appear in configuration, status messages, and Pi's footer, so the active execution environment stays visible.
+Each `user@host:port` endpoint remembers its remote working directory, note, server-specific memory, and port-forward configuration locally. Notes such as `H100 training`, `staging`, or `customer demo` appear in configuration, status messages, and Pi's footer, so the active execution environment stays visible. Server memory is automatically injected into the model context whenever that endpoint is connected as the active remote workspace.
 
 ### Resilient and bounded by default
 
@@ -66,6 +66,7 @@ Requires Node.js 20+. The remote server must provide Bash, SFTP, and GNU `timeou
 /remote ssh root@gpu-box.example.com -p 2202
 /remote cd /srv/project
 /remote config note H100 training server
+/remote config memory Use /opt/conda/bin/python and never stop shared jobs.
 /remote status
 ```
 
@@ -120,7 +121,7 @@ The default foreground timeout prevents an accidental long-running command from 
 /remote
 ```
 
-Endpoint notes and working directories survive Pi restarts because they are stored in the local remote configuration.
+Endpoint notes, working directories, and server-specific memories survive Pi restarts because they are stored in the local remote configuration. When Pi connects to an endpoint, its memory is added to the system context on every agent run while remote tool routing remains active. Disconnecting or switching to tunnel-only mode removes it from subsequent model requests.
 
 ### 4. Expose a remote service while editing locally
 
@@ -165,6 +166,8 @@ These requests are handled through the agent-facing `ssh_remote_control` tool; s
 | `/remote use USER@HOST:PORT` | Select a saved endpoint |
 | `/remote config note TEXT` | Persist a note for the selected endpoint |
 | `/remote config note --clear` | Clear its note |
+| `/remote config memory TEXT` | Persist context that is injected while working on this endpoint |
+| `/remote config memory --clear` | Clear its server-specific memory |
 | `/remote config cwd PATH` | Persist its default remote working directory |
 | `/remote cd PATH` | Change the connected remote cwd and persist it |
 | `/remote config forward MAPPING...` | Persist port forwards such as `7860:127.0.0.1:7860` |
@@ -187,12 +190,109 @@ Endpoint configuration is stored locally in:
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-Saved values include endpoints, active endpoint, notes, remote working directories, forwards, and preview settings. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
+Saved values include endpoints, active endpoint, notes, server-specific memories, remote working directories, forwards, and preview settings. Server memory is user-configured trusted context and is inserted into each model request only while that endpoint is the active remote workspace; it is not read from the remote server. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
 
 New or changed host keys require interactive confirmation and are stored separately from OpenSSH. Remote output sent to the model is limited to 2,000 lines or 50 KB; oversized complete output is written to a temporary local file. Preview-line settings affect only the collapsed UI.
 
 ## Current SSH scope
 
 The extension currently supports direct SSH commands with `-p` and `-l`. It does not yet consume `~/.ssh/config`, `IdentityFile`, or ProxyJump settings.
+
+## Release history
+
+Release dates below are npm publication dates. Every release records user-visible additions, changes, and bug fixes; `None` means that category had no changes in that release.
+
+### 0.1.5 — 2026-08-04
+
+**Added**
+
+- Added persistent, endpoint-specific server memory through `/remote config memory TEXT` and the `ssh_remote_control` `memory` action.
+- Added automatic injection of that memory into every model request while the matching endpoint is the active remote workspace.
+
+**Changed**
+
+- Server memory is removed from subsequent model requests when remote tool routing is disabled, including disconnect and tunnel-only mode.
+- `/remote config` now shows the memory stored for each endpoint.
+
+**Fixed**
+
+- None.
+
+### 0.1.4 — 2026-07-31
+
+**Added**
+
+- Added persistent endpoint notes through `/remote config note TEXT` and the `ssh_remote_control` `note` action.
+- Added per-command timeout overrides through `/remote exec --timeout SECONDS` and the tool's `timeout` parameter.
+
+**Changed**
+
+- Remote commands now default to a 30-second timeout and endpoint notes appear in status, connection, reconnection, and footer labels.
+- Expanded the documentation around agent-first workflows, multi-server operation, background jobs, and tunnel mode.
+
+**Fixed**
+
+- Fixed remote commands that could run without a deadline by enforcing GNU `timeout` remotely and a local fallback timer.
+- Fixed timeout reporting for processes terminated with timeout-related exit codes 124 and 137.
+
+### 0.1.3 — 2026-07-24
+
+**Added**
+
+- Added configurable collapsed command previews with `/remote config display-lines N`, `/remote exec --lines N`, and the tool's `displayLines` parameter.
+- Added expandable custom rendering for remote command results.
+
+**Changed**
+
+- Remote command previews default to the last five visual lines while model-facing output remains limited to 2,000 lines or 50 KB.
+- Oversized complete output is saved to a permission-restricted local temporary file.
+
+**Fixed**
+
+- Fixed `/remote exec` truncating its notification to an arbitrary 4,000 characters without preserving or identifying the full output.
+
+### 0.1.2 — 2026-07-24
+
+**Added**
+
+- None.
+
+**Changed**
+
+- Republished the 0.1.1 runtime as 0.1.2 to align npm package version metadata; there were no runtime code changes.
+
+**Fixed**
+
+- None.
+
+### 0.1.1 — 2026-07-24
+
+**Added**
+
+- Added the shorter `/remote ssh USER@HOST [-p PORT]` connection command.
+
+**Changed**
+
+- `/remote ssh` now saves, selects, and immediately connects to the endpoint instead of only storing it.
+
+**Fixed**
+
+- Fixed help and error text that still instructed users to run the obsolete `/remote config ssh ssh ...` form.
+
+### 0.1.0 — 2026-07-24
+
+**Added**
+
+- Initial release with persistent multi-endpoint SSH workspaces and remote working directories.
+- Added transparent routing for Pi's `read`, `write`, `edit`, `bash`, and user shell operations.
+- Added SSH-agent/password authentication, interactive host-key verification, automatic reconnection, SFTP file access, bounded command output, and local TCP forwarding.
+
+**Changed**
+
+- None.
+
+**Fixed**
+
+- None.
 
 MIT licensed.

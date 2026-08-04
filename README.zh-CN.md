@@ -51,9 +51,10 @@ SSH remote H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 - SSH 地址；
 - 默认工作目录；
 - 服务器备注；
+- 服务器特定记忆；
 - 端口转发配置。
 
-例如可以把几台机器分别备注为 `8xH100 训练机`、`预发布环境`、`线上只读机`。这些配置保存在本地，重启 Pi 后仍然存在。
+例如可以把几台机器分别备注为 `8xH100 训练机`、`预发布环境`、`线上只读机`。还可以为每个 `user@host:port` 保存独立记忆，例如指定 Python 环境、共享任务保护规则或部署约定。连接该 endpoint 并启用远端工具路由后，这段记忆会自动注入模型上下文；断开连接或切换到纯隧道模式后，后续请求不再注入。所有配置保存在本地，重启 Pi 后仍然存在。
 
 ### 断线后可以自动恢复
 
@@ -106,6 +107,7 @@ pi install npm:pi-ssh-remote
 ```text
 /remote cd /srv/project
 /remote config note H100 训练机
+/remote config memory 使用 /opt/conda/bin/python，不要停止其他用户的共享任务。
 ```
 
 查看当前状态：
@@ -218,6 +220,8 @@ Pi 会通过插件提供的 `ssh_remote_control` 工具完成这些操作。
 | `/remote use USER@HOST:PORT` | 切换到指定服务器 |
 | `/remote config note TEXT` | 给当前服务器添加或修改备注 |
 | `/remote config note --clear` | 清除当前服务器备注 |
+| `/remote config memory TEXT` | 保存连接该服务器时自动注入上下文的记忆 |
+| `/remote config memory --clear` | 清除当前服务器的特定记忆 |
 | `/remote config cwd PATH` | 设置默认远程工作目录 |
 | `/remote cd PATH` | 切换当前远程目录并保存 |
 | `/remote config forward MAPPING...` | 保存端口转发配置，例如 `7860:127.0.0.1:7860` |
@@ -245,9 +249,12 @@ Pi 会通过插件提供的 `ssh_remote_control` 工具完成这些操作。
 - 已保存的服务器；
 - 当前选中的服务器；
 - 服务器备注；
+- 服务器特定记忆；
 - 默认远程目录；
 - 端口转发配置；
 - 命令预览设置。
+
+服务器记忆是由用户在本地配置的可信上下文，不会从远程服务器自动读取；仅当对应 endpoint 作为远端工作区启用时才会加入每次模型请求。
 
 密码不会写入配置文件。插件会优先使用 SSH agent；如果需要手动输入密码，密码只会缓存在当前 Pi 进程的内存中。
 
@@ -263,5 +270,102 @@ Pi 会通过插件提供的 `ssh_remote_control` 工具完成这些操作。
 ## 当前限制
 
 目前只支持 SSH 直连，以及 `-p`、`-l` 参数。暂不读取 `~/.ssh/config`，也不支持 `IdentityFile` 和 ProxyJump。
+
+## 版本更新记录
+
+以下日期均为 npm 发布时间。每次发布都记录用户可见的新增内容、行为变更和 Bug 修复；“无”表示该版本在对应类别没有变化。
+
+### 0.1.5 — 2026-08-04
+
+**新增**
+
+- 新增 endpoint 级持久化服务器记忆，支持 `/remote config memory TEXT` 和 `ssh_remote_control` 的 `memory` action。
+- 对应 endpoint 作为当前远程工作区时，在每次模型请求中自动注入服务器记忆。
+
+**变更**
+
+- 断开连接、关闭远端工具路由或进入纯隧道模式后，后续模型请求不再包含服务器记忆。
+- `/remote config` 现在会显示每个 endpoint 保存的记忆。
+
+**修复**
+
+- 无。
+
+### 0.1.4 — 2026-07-31
+
+**新增**
+
+- 新增 endpoint 备注，支持 `/remote config note TEXT` 和 `ssh_remote_control` 的 `note` action。
+- 新增单次命令超时覆盖，支持 `/remote exec --timeout SECONDS` 和工具的 `timeout` 参数。
+
+**变更**
+
+- 远程命令默认超时改为 30 秒；备注会显示在状态、连接、重连提示和底部状态栏中。
+- 扩充了 Agent 工作流、多服务器、后台任务和纯隧道模式文档。
+
+**修复**
+
+- 修复部分远程命令没有截止时间、可能一直占用 Agent 的问题：远端使用 GNU `timeout`，本地增加兜底定时器。
+- 修复退出码 124 和 137 未被统一识别为超时的问题。
+
+### 0.1.3 — 2026-07-24
+
+**新增**
+
+- 新增可配置的命令折叠预览，支持 `/remote config display-lines N`、`/remote exec --lines N` 和工具的 `displayLines` 参数。
+- 新增远程命令结果的展开显示。
+
+**变更**
+
+- 命令折叠预览默认显示最后 5 个视觉行；发送给模型的输出仍限制为 2,000 行或 50 KB。
+- 超限的完整输出会保存到权限受限的本地临时文件。
+
+**修复**
+
+- 修复 `/remote exec` 直接按 4,000 字符截断通知、且不保留或提示完整输出位置的问题。
+
+### 0.1.2 — 2026-07-24
+
+**新增**
+
+- 无。
+
+**变更**
+
+- 将 0.1.1 的运行时代码以 0.1.2 重新发布，用于对齐 npm 包版本元数据；没有运行时代码变化。
+
+**修复**
+
+- 无。
+
+### 0.1.1 — 2026-07-24
+
+**新增**
+
+- 新增简化命令 `/remote ssh USER@HOST [-p PORT]`。
+
+**变更**
+
+- `/remote ssh` 现在会保存、选中并立即连接 endpoint，而不只是保存配置。
+
+**修复**
+
+- 修复帮助和错误信息仍提示使用旧命令 `/remote config ssh ssh ...` 的问题。
+
+### 0.1.0 — 2026-07-24
+
+**新增**
+
+- 首次发布，支持持久化多 endpoint SSH 工作区和远程工作目录。
+- 新增 Pi `read`、`write`、`edit`、`bash` 和用户 Shell 操作的透明远端路由。
+- 新增 SSH agent/密码认证、交互式主机密钥校验、自动重连、SFTP 文件访问、命令输出限制和本地 TCP 端口转发。
+
+**变更**
+
+- 无。
+
+**修复**
+
+- 无。
 
 MIT License。
