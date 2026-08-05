@@ -8,6 +8,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Added
 
+- None.
+
+### Changed
+
+- None.
+
+### Fixed
+
+- None.
+
+## [0.1.6] - 2026-08-05
+
+### Added
+
 - Added configurable line and byte budgets for remote reads, remote commands, and aggregate per-turn tool output.
 - Added bounded range reads for remote text files with normal `offset` and `limit` continuation.
 
@@ -116,7 +130,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.4
 [0.1.3]: https://www.npmjs.com/package/pi-ssh-remote/v/0.1.3
