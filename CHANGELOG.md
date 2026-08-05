@@ -8,6 +8,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Added
 
+- None.
+
+### Changed
+
+- None.
+
+### Fixed
+
+- None.
+
+## [0.1.7] - 2026-08-05
+
+### Added
+
+- Added non-secret, session-scoped SSH workspace state for endpoint, remote directory, tool-routing mode, and port forwards.
+
+### Changed
+
+- `/new` now inherits the active SSH workspace, forks and clones retain their source workspace, and `/resume` restores the selected historical session's recorded workspace.
+- Session changes close the previous transport cleanly and reconnect the target workspace without storing passwords or other credentials in session files.
+
+### Fixed
+
+- None.
+
+## [0.1.6] - 2026-08-05
+
+### Added
+
 - Added configurable line and byte budgets for remote reads, remote commands, and aggregate per-turn tool output.
 - Added bounded range reads for remote text files with normal `offset` and `limit` continuation.
 
@@ -16,7 +45,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 - Remote text reads now default to 400 lines or 16 KB, remote command results default to the last 200 lines or 8 KB, and each agent turn defaults to a shared 32 KB remote output budget.
 - Remote command output now streams through bounded buffers, with complete oversized stdout written to a permission-restricted local temporary file.
 - Collapsed command previews are now limited to at most 50 visual lines and remain independent from model-facing output.
-- SSH workspace state is now session-aware: `/new` inherits the current connection, forks and clones retain their source workspace, and `/resume` restores the selected session's endpoint, remote directory, routing mode, and forwards.
 - Moved the complete release history into this changelog and kept concise release indexes in the English and Chinese READMEs.
 
 ### Fixed
@@ -117,7 +145,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.4
 [0.1.3]: https://www.npmjs.com/package/pi-ssh-remote/v/0.1.3

@@ -205,13 +205,13 @@ The extension currently supports direct SSH commands with `-p` and `-l`. It does
 
 ## Releases
 
-Latest release: [v0.1.5](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.5)
+Latest release: [v0.1.7](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.7)
 
 | Version | Date | Highlights |
 |---|---|---|
+| [0.1.7](CHANGELOG.md#017---2026-08-05) | 2026-08-05 | Session-aware SSH workspace restoration for new, forked, and resumed sessions |
+| [0.1.6](CHANGELOG.md#016---2026-08-05) | 2026-08-05 | Bounded remote reads, streamed command output, and per-turn output budgets |
 | [0.1.5](CHANGELOG.md#015---2026-08-04) | 2026-08-04 | Endpoint-specific server memory and automatic context injection |
-| [0.1.4](CHANGELOG.md#014---2026-07-31) | 2026-07-31 | Endpoint notes and enforced remote command timeouts |
-| [0.1.3](CHANGELOG.md#013---2026-07-24) | 2026-07-24 | Configurable and expandable command-output previews |
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release history, including additions, behavior changes, and bug fixes.
 

@@ -283,13 +283,13 @@ Pi 会通过插件提供的 `ssh_remote_control` 工具完成这些操作。
 
 ## 版本发布
 
-最新版本：[v0.1.5](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.5)
+最新版本：[v0.1.7](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.7)
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
+| [0.1.7](CHANGELOG.md#017---2026-08-05) | 2026-08-05 | 新建、分叉和恢复 session 时自动恢复对应 SSH 工作区 |
+| [0.1.6](CHANGELOG.md#016---2026-08-05) | 2026-08-05 | 有界远端读取、流式命令输出与每轮输出预算 |
 | [0.1.5](CHANGELOG.md#015---2026-08-04) | 2026-08-04 | endpoint 级服务器记忆与自动上下文注入 |
-| [0.1.4](CHANGELOG.md#014---2026-07-31) | 2026-07-31 | endpoint 备注与远程命令强制超时 |
-| [0.1.3](CHANGELOG.md#013---2026-07-24) | 2026-07-24 | 可配置、可展开的命令输出预览 |
 
 完整的新增内容、行为变更和 Bug 修复记录请查看 [CHANGELOG.md](CHANGELOG.md)。
 
