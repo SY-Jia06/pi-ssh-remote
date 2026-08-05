@@ -8,15 +8,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Added
 
-- None.
+- Added configurable line and byte budgets for remote reads, remote commands, and aggregate per-turn tool output.
+- Added bounded range reads for remote text files with normal `offset` and `limit` continuation.
 
 ### Changed
 
+- Remote text reads now default to 400 lines or 16 KB, remote command results default to the last 200 lines or 8 KB, and each agent turn defaults to a shared 32 KB remote output budget.
+- Remote command output now streams through bounded buffers, with complete oversized stdout written to a permission-restricted local temporary file.
+- Collapsed command previews are now limited to at most 50 visual lines and remain independent from model-facing output.
 - Moved the complete release history into this changelog and kept concise release indexes in the English and Chinese READMEs.
 
 ### Fixed
 
-- None.
+- Fixed remote text reads downloading complete files over SFTP before applying line and byte limits.
+- Fixed `ssh_remote_control exec` accumulating complete stdout in memory before truncation.
 
 ## [0.1.5] - 2026-08-04
 

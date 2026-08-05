@@ -7,8 +7,8 @@
  */
 
 import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, join, posix, relative, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { Type } from "typebox";
@@ -24,6 +24,7 @@ import {
   createWriteTool,
   formatSize,
   keyHint,
+  truncateHead,
   truncateTail,
   type BashOperations,
   type EditOperations,
@@ -62,6 +63,11 @@ interface RemoteConfig {
   activeEndpoint?: string;
   endpoints?: Record<string, RemoteEndpointConfig>;
   displayLines?: number;
+  readMaxLines?: number;
+  readMaxBytes?: number;
+  execMaxLines?: number;
+  execMaxBytes?: number;
+  turnMaxBytes?: number;
   /** Legacy fields migrated into endpoints on the next config write. */
   sshCommand?: string;
   remoteCwd?: string;
@@ -79,6 +85,14 @@ const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
 const REMOTE_CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
 const FALLBACK_REMOTE_CWD = "~";
 const DEFAULT_DISPLAY_LINES = 5;
+const MAX_DISPLAY_LINES = 50;
+const DEFAULT_READ_MAX_LINES = 400;
+const DEFAULT_READ_MAX_BYTES = 16 * 1024;
+const DEFAULT_EXEC_MAX_LINES = 200;
+const DEFAULT_EXEC_MAX_BYTES = 8 * 1024;
+const DEFAULT_TURN_MAX_BYTES = 32 * 1024;
+const MIN_MODEL_OUTPUT_BYTES = 1024;
+const OUTPUT_FOOTER_RESERVE_BYTES = 512;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
 const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
 const CACHE_KEY = "__piHpcCredentialCacheV1";
@@ -158,12 +172,28 @@ function quote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function parseDisplayLines(value: unknown): number {
-  const lines = typeof value === "number" ? value : Number(value);
-  if (!Number.isInteger(lines) || lines < 1 || lines > DEFAULT_MAX_LINES) {
-    throw new Error(`Display lines must be an integer from 1 to ${DEFAULT_MAX_LINES}`);
+function parseBoundedInteger(value: unknown, label: string, maximum: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new Error(`${label} must be an integer from 1 to ${maximum}`);
   }
-  return lines;
+  return parsed;
+}
+
+function parseDisplayLines(value: unknown): number {
+  return parseBoundedInteger(value, "Display lines", MAX_DISPLAY_LINES);
+}
+
+function parseOutputLines(value: unknown, label: string): number {
+  return parseBoundedInteger(value, label, DEFAULT_MAX_LINES);
+}
+
+function parseOutputBytes(value: unknown, label: string, maximum = DEFAULT_MAX_BYTES): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < MIN_MODEL_OUTPUT_BYTES || parsed > maximum) {
+    throw new Error(`${label} must be an integer from ${MIN_MODEL_OUTPUT_BYTES} to ${maximum}`);
+  }
+  return parsed;
 }
 
 function parseRemoteTimeout(value: unknown): number {
@@ -181,6 +211,15 @@ function withRemoteTimeout(command: string, timeoutSeconds: number): string {
 function configuredDisplayLines(config = loadRemoteConfig()): number {
   try { return parseDisplayLines(config.displayLines ?? DEFAULT_DISPLAY_LINES); }
   catch { return DEFAULT_DISPLAY_LINES; }
+}
+
+function configuredOutputLimits(config = loadRemoteConfig()) {
+  const readMaxLines = (() => { try { return parseOutputLines(config.readMaxLines ?? DEFAULT_READ_MAX_LINES, "Read max lines"); } catch { return DEFAULT_READ_MAX_LINES; } })();
+  const readMaxBytes = (() => { try { return parseOutputBytes(config.readMaxBytes ?? DEFAULT_READ_MAX_BYTES, "Read max bytes"); } catch { return DEFAULT_READ_MAX_BYTES; } })();
+  const execMaxLines = (() => { try { return parseOutputLines(config.execMaxLines ?? DEFAULT_EXEC_MAX_LINES, "Exec max lines"); } catch { return DEFAULT_EXEC_MAX_LINES; } })();
+  const execMaxBytes = (() => { try { return parseOutputBytes(config.execMaxBytes ?? DEFAULT_EXEC_MAX_BYTES, "Exec max bytes"); } catch { return DEFAULT_EXEC_MAX_BYTES; } })();
+  const turnMaxBytes = (() => { try { return parseOutputBytes(config.turnMaxBytes ?? DEFAULT_TURN_MAX_BYTES, "Turn max bytes", DEFAULT_MAX_BYTES * 4); } catch { return DEFAULT_TURN_MAX_BYTES; } })();
+  return { readMaxLines, readMaxBytes, execMaxLines, execMaxBytes, turnMaxBytes };
 }
 
 function commandFromEndpointKey(key: string): string | undefined {
@@ -215,13 +254,27 @@ function normalizeRemoteConfig(config: RemoteConfig): RemoteConfig {
   if (activeEndpoint && !endpoints[activeEndpoint]) activeEndpoint = undefined;
   activeEndpoint ??= Object.keys(endpoints)[0];
   let displayLines: number | undefined;
-  try { displayLines = config.displayLines === undefined ? undefined : parseDisplayLines(config.displayLines); }
-  catch { displayLines = undefined; }
+  let readMaxLines: number | undefined;
+  let readMaxBytes: number | undefined;
+  let execMaxLines: number | undefined;
+  let execMaxBytes: number | undefined;
+  let turnMaxBytes: number | undefined;
+  try { displayLines = config.displayLines === undefined ? undefined : parseDisplayLines(config.displayLines); } catch {}
+  try { readMaxLines = config.readMaxLines === undefined ? undefined : parseOutputLines(config.readMaxLines, "Read max lines"); } catch {}
+  try { readMaxBytes = config.readMaxBytes === undefined ? undefined : parseOutputBytes(config.readMaxBytes, "Read max bytes"); } catch {}
+  try { execMaxLines = config.execMaxLines === undefined ? undefined : parseOutputLines(config.execMaxLines, "Exec max lines"); } catch {}
+  try { execMaxBytes = config.execMaxBytes === undefined ? undefined : parseOutputBytes(config.execMaxBytes, "Exec max bytes"); } catch {}
+  try { turnMaxBytes = config.turnMaxBytes === undefined ? undefined : parseOutputBytes(config.turnMaxBytes, "Turn max bytes", DEFAULT_MAX_BYTES * 4); } catch {}
 
   return {
     ...(activeEndpoint ? { activeEndpoint } : {}),
     ...(Object.keys(endpoints).length ? { endpoints } : {}),
     ...(displayLines !== undefined ? { displayLines } : {}),
+    ...(readMaxLines !== undefined ? { readMaxLines } : {}),
+    ...(readMaxBytes !== undefined ? { readMaxBytes } : {}),
+    ...(execMaxLines !== undefined ? { execMaxLines } : {}),
+    ...(execMaxBytes !== undefined ? { execMaxBytes } : {}),
+    ...(turnMaxBytes !== undefined ? { turnMaxBytes } : {}),
   };
 }
 
@@ -299,18 +352,99 @@ function displayFingerprint(hex: string): string {
   return `SHA256:${Buffer.from(hex, "hex").toString("base64").replace(/=+$/, "")}`;
 }
 
-function formatRemoteOutput(output: string) {
-  const truncation = truncateTail(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-  const content = truncation.content || "Remote command completed.";
-  if (!truncation.truncated) return { text: content, content, truncation };
-
+function createOutputFile(): { path: string; fd: number } {
   const outputDir = mkdtempSync(join(tmpdir(), "pi-ssh-remote-output-"));
-  const fullOutputPath = join(outputDir, "output.log");
-  writeFileSync(fullOutputPath, output, { encoding: "utf8", mode: 0o600 });
-  const startLine = truncation.totalLines - truncation.outputLines + 1;
-  const limit = truncation.truncatedBy === "bytes" ? ` (${formatSize(DEFAULT_MAX_BYTES)} limit)` : "";
-  const text = `${content}\n\n[Showing lines ${startLine}-${truncation.totalLines} of ${truncation.totalLines}${limit}. Full output: ${fullOutputPath}]`;
-  return { text, content, truncation, fullOutputPath };
+  const path = join(outputDir, "output.log");
+  return { path, fd: openSync(path, "w", 0o600) };
+}
+
+function saveOutput(output: string): string {
+  const file = createOutputFile();
+  try { writeSync(file.fd, output); }
+  finally { closeSync(file.fd); }
+  return file.path;
+}
+
+class RemoteExecAccumulator {
+  private chunks: Buffer[] = [];
+  private tail = Buffer.alloc(0);
+  private stderrTail = Buffer.alloc(0);
+  private outputFile: { path: string; fd: number } | undefined;
+  private totalBytes = 0;
+  private newlineCount = 0;
+  private lastByte: number | undefined;
+
+  constructor(private maxLines: number, private maxBytes: number) {}
+
+  append(chunk: Buffer): void {
+    if (!chunk.length) return;
+    this.totalBytes += chunk.length;
+    for (const byte of chunk) if (byte === 10) this.newlineCount++;
+    this.lastByte = chunk[chunk.length - 1];
+
+    if (!this.outputFile && this.totalBytes > this.maxBytes) {
+      this.outputFile = createOutputFile();
+      for (const previous of this.chunks) writeSync(this.outputFile.fd, previous);
+      this.chunks = [];
+    }
+    if (this.outputFile) writeSync(this.outputFile.fd, chunk);
+    else this.chunks.push(chunk);
+
+    this.tail = Buffer.concat([this.tail, chunk]);
+    const tailBytes = this.maxBytes + OUTPUT_FOOTER_RESERVE_BYTES + 4096;
+    if (this.tail.length > tailBytes) this.tail = this.tail.subarray(this.tail.length - tailBytes);
+  }
+
+  appendStderr(chunk: Buffer): void {
+    this.stderrTail = Buffer.concat([this.stderrTail, chunk]);
+    if (this.stderrTail.length > this.maxBytes) this.stderrTail = this.stderrTail.subarray(this.stderrTail.length - this.maxBytes);
+  }
+
+  private ensureOutputFile(): string {
+    if (!this.outputFile) {
+      this.outputFile = createOutputFile();
+      for (const chunk of this.chunks) writeSync(this.outputFile.fd, chunk);
+      this.chunks = [];
+    }
+    return this.outputFile.path;
+  }
+
+  finish() {
+    const totalLines = this.totalBytes ? this.newlineCount + (this.lastByte === 10 ? 0 : 1) : 0;
+    const source = this.outputFile ? this.tail.toString("utf8") : Buffer.concat(this.chunks).toString("utf8");
+    const contentBudget = Math.max(1, this.maxBytes - OUTPUT_FOOTER_RESERVE_BYTES);
+    const base = truncateTail(source, { maxLines: this.maxLines, maxBytes: contentBudget });
+    const truncated = this.totalBytes > contentBudget || totalLines > this.maxLines || base.truncated;
+    const truncation = {
+      ...base,
+      truncated,
+      totalLines,
+      totalBytes: this.totalBytes,
+      maxLines: this.maxLines,
+      maxBytes: this.maxBytes,
+    };
+    const content = base.content || "Remote command completed.";
+    let fullOutputPath: string | undefined;
+    let text = content;
+    if (truncated) {
+      fullOutputPath = this.ensureOutputFile();
+      const startLine = Math.max(1, totalLines - base.outputLines + 1);
+      text += `\n\n[Showing lines ${startLine}-${totalLines} of ${totalLines} (${formatSize(this.maxBytes)} model-output limit). Full output: ${fullOutputPath}]`;
+    }
+    this.close();
+    return { text, content, truncation, fullOutputPath };
+  }
+
+  errorMessage(): string {
+    return this.stderrTail.toString("utf8").trim();
+  }
+
+  close(): void {
+    if (!this.outputFile) return;
+    const file = this.outputFile;
+    this.outputFile = undefined;
+    closeSync(file.fd);
+  }
 }
 
 function previewRemoteOutput(output: string, displayLines: number): string {
@@ -429,6 +563,53 @@ function execRemote(
   });
 }
 
+function execRemoteLimited(
+  client: Client,
+  command: string,
+  timeoutSeconds: number,
+  maxLines: number,
+  maxBytes: number,
+): Promise<ReturnType<RemoteExecAccumulator["finish"]>> {
+  const resolvedTimeout = parseRemoteTimeout(timeoutSeconds);
+  return new Promise((resolve, reject) => {
+    client.exec(withRemoteTimeout(command, resolvedTimeout), (error, stream) => {
+      if (error) return reject(error);
+      const accumulator = new RemoteExecAccumulator(maxLines, maxBytes);
+      let locallyTimedOut = false;
+      let settled = false;
+      const timer = setTimeout(() => {
+        locallyTimedOut = true;
+        stream.close();
+      }, (resolvedTimeout + 8) * 1000);
+      const cleanup = () => clearTimeout(timer);
+      const fail = (failure: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        accumulator.close();
+        reject(failure);
+      };
+      stream.on("data", (chunk: Buffer) => accumulator.append(chunk));
+      stream.stderr.on("data", (chunk: Buffer) => accumulator.appendStderr(chunk));
+      stream.once("error", (streamError: Error) => fail(streamError));
+      stream.on("close", (code: number | null) => {
+        if (settled) return;
+        cleanup();
+        if (locallyTimedOut || code === 124 || code === 137) {
+          fail(new Error(`Remote command timed out after ${resolvedTimeout} seconds`));
+          return;
+        }
+        if (code !== 0) {
+          fail(new Error(accumulator.errorMessage() || `Remote command exited with code ${code}`));
+          return;
+        }
+        settled = true;
+        resolve(accumulator.finish());
+      });
+    });
+  });
+}
+
 function getSftp(client: Client): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => client.sftp((error, sftp) => error ? reject(error) : resolve(sftp)));
 }
@@ -480,6 +661,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const forwardServers = new Map<number, Server>();
   let lastConnectionError: string | undefined;
   let lastCommand = credentialCache.resume?.command ?? activeSshCommand() ?? "";
+  let turnOutputBytes = 0;
 
   const configuredCwd = (command: string): string =>
     endpointConfig(loadRemoteConfig(), command).remoteCwd || FALLBACK_REMOTE_CWD;
@@ -493,6 +675,62 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     const prefix = localCwd.endsWith(sep) ? localCwd : localCwd + sep;
     if (path.startsWith(prefix)) return remote.cwd.replace(/\/$/, "") + "/" + relative(localCwd, path).split(sep).join("/");
     return path;
+  };
+
+  const remotePath = (path: string): string => {
+    const normalized = path.replace(/^@/, "");
+    if (normalized.startsWith("/")) return mapPath(normalized);
+    if (!remote) return normalized;
+    return posix.join(remote.cwd, normalized);
+  };
+
+  const limitRemoteToolResult = (result: any, kind: "read" | "exec", startLine = 1, requestedMaxLines?: number) => {
+    const limits = configuredOutputLimits();
+    const configuredMaxBytes = kind === "read" ? limits.readMaxBytes : limits.execMaxBytes;
+    const configuredMaxLines = kind === "read" ? limits.readMaxLines : limits.execMaxLines;
+    const maxLines = Math.min(configuredMaxLines, requestedMaxLines ?? configuredMaxLines);
+    const remaining = Math.max(0, limits.turnMaxBytes - turnOutputBytes);
+    if (remaining < MIN_MODEL_OUTPUT_BYTES) {
+      const text = `[Remote tool output omitted because this turn has used its ${formatSize(limits.turnMaxBytes)} model-output budget. Run a narrower follow-up command.]`;
+      turnOutputBytes += Buffer.byteLength(text, "utf8");
+      return { ...result, content: [{ type: "text", text }], details: { ...(result.details ?? {}), turnBudgetExceeded: true } };
+    }
+
+    const maxBytes = Math.min(configuredMaxBytes, remaining);
+    const textIndex = result.content?.findIndex((item: any) => item.type === "text") ?? -1;
+    if (textIndex < 0) return result;
+    const original = result.content[textIndex].text ?? "";
+    const reserveBytes = result.details?.modelLimited ? 0 : OUTPUT_FOOTER_RESERVE_BYTES;
+    const contentBudget = Math.max(1, maxBytes - reserveBytes);
+    const truncation = kind === "read"
+      ? truncateHead(original, { maxLines, maxBytes: contentBudget })
+      : truncateTail(original, { maxLines, maxBytes: contentBudget });
+    let text = truncation.content;
+    let fullOutputPath = result.details?.fullOutputPath as string | undefined;
+    if (truncation.firstLineExceedsLimit) {
+      text = `[Line ${startLine} exceeds the ${formatSize(maxBytes)} remote read limit. Use bash with sed/head -c to inspect a bounded fragment.]`;
+    } else if (truncation.truncated) {
+      if (kind === "read") {
+        const nextOffset = startLine + truncation.outputLines;
+        text += `\n\n[Showing ${truncation.outputLines} lines (${formatSize(maxBytes)} remote read limit). Use offset=${nextOffset} to continue.]`;
+      } else {
+        fullOutputPath ??= saveOutput(original);
+        text += `\n\n[Showing the last ${truncation.outputLines} lines (${formatSize(maxBytes)} remote exec limit). Full output: ${fullOutputPath}]`;
+      }
+    }
+    const content = [...result.content];
+    content[textIndex] = { ...content[textIndex], text: text || (kind === "exec" ? "Remote command completed." : "") };
+    const actualBytes = Buffer.byteLength(content[textIndex].text, "utf8");
+    turnOutputBytes += actualBytes;
+    return {
+      ...result,
+      content,
+      details: {
+        ...(result.details ?? {}),
+        ...(truncation.truncated ? { truncation } : {}),
+        ...(fullOutputPath ? { fullOutputPath } : {}),
+      },
+    };
   };
 
   const status = (ctx: any) => {
@@ -713,18 +951,54 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     ctx.ui.notify(forgetPassword ? "SSH remote disconnected and cached password cleared" : "SSH remote mode disabled (password remains cached in memory only)", "info");
   };
 
+  const detectRemoteMimeType = async (path: string): Promise<string | undefined> => {
+    try {
+      return (await withReconnect((client) => execRemote(client, `file --mime-type -b -- ${quote(remotePath(path))}`))).toString().trim() || undefined;
+    } catch { return undefined; }
+  };
+
+  const isTextMimeType = (mime: string): boolean =>
+    mime.startsWith("text/") || /\/(?:json|ld\+json|xml|javascript|x-sh|x-shellscript|x-empty)$/.test(mime);
+
   const remoteReadOps = (): ReadOperations => ({
     readFile: (path) => withReconnect((client) => withSftp(client, (sftp) =>
       new Promise<Buffer>((resolve, reject) => sftp.readFile(mapPath(path), (error, data) => error ? reject(error) : resolve(data))))),
     access: (path) => withReconnect((client) => withSftp(client, (sftp) =>
       new Promise<void>((resolve, reject) => sftp.stat(mapPath(path), (error) => error ? reject(error) : resolve())))),
     detectImageMimeType: async (path) => {
-      try {
-        const mime = (await withReconnect((client) => execRemote(client, `file --mime-type -b -- ${quote(mapPath(path))}`))).toString().trim();
-        return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime) ? mime : null;
-      } catch { return null; }
+      const mime = await detectRemoteMimeType(path);
+      return mime && ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime) ? mime : null;
     },
   });
+
+  const executeRemoteRead = async (id: string, params: any, signal: AbortSignal | undefined, update: any) => {
+    if (signal?.aborted) throw new Error("aborted");
+    const path = remotePath(params.path);
+    await withReconnect((client) => withSftp(client, (sftp) =>
+      new Promise<void>((resolve, reject) => sftp.stat(path, (error) => error ? reject(error) : resolve()))));
+    const mime = await detectRemoteMimeType(path);
+    if (mime && ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime)) {
+      const result = await createReadTool(localCwd, { operations: remoteReadOps() }).execute(id, params, signal, update);
+      return limitRemoteToolResult(result, "read", params.offset ?? 1);
+    }
+    if (mime && !isTextMimeType(mime)) throw new Error(`Refusing to read remote binary file as text (${mime}): ${params.path}`);
+
+    const limits = configuredOutputLimits();
+    const startLine = Math.max(1, Math.floor(Number(params.offset ?? 1)));
+    const requestedLines = Math.max(1, Math.floor(Number(params.limit ?? limits.readMaxLines)));
+    const linesToFetch = Math.min(requestedLines, limits.readMaxLines) + 1;
+    const endLine = startLine + linesToFetch - 1;
+    const transferBytes = Math.min(DEFAULT_MAX_BYTES, limits.readMaxBytes + OUTPUT_FOOTER_RESERVE_BYTES + 4096);
+    const command = `sed -n '${startLine},${endLine}p' ${quote(path)} | head -c ${transferBytes}`;
+    const output = await withReconnect((client) => execRemote(client, command, false, DEFAULT_REMOTE_TIMEOUT_SECONDS));
+    if (signal?.aborted) throw new Error("aborted");
+    if (!output.length && startLine > 1) throw new Error(`Offset ${startLine} is beyond end of remote file`);
+    const result = {
+      content: [{ type: "text", text: output.toString("utf8") }],
+      details: { remoteRange: { path, startLine, requestedLines: Math.min(requestedLines, limits.readMaxLines) } },
+    };
+    return limitRemoteToolResult(result, "read", startLine, Math.min(requestedLines, limits.readMaxLines));
+  };
 
   const remoteWriteOps = (): WriteOperations => ({
     writeFile: (path, content) => withReconnect((client) => withSftp(client, (sftp) =>
@@ -769,20 +1043,37 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const localWrite = createWriteTool(localCwd);
   const localEdit = createEditTool(localCwd);
   const localBash = createBashTool(localCwd);
-  pi.registerTool({ ...localRead, execute: (id, params, signal, update) => remote && routeRemoteTools ? createReadTool(localCwd, { operations: remoteReadOps() }).execute(id, params, signal, update) : localRead.execute(id, params, signal, update) });
+  pi.registerTool({
+    ...localRead,
+    description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue.`,
+    promptGuidelines: ["Use read with offset/limit for remote code and logs; inspect large files in focused chunks instead of reading them wholesale."],
+    execute: (id, params, signal, update) => remote && routeRemoteTools
+      ? executeRemoteRead(id, params, signal, update)
+      : localRead.execute(id, params, signal, update),
+  });
   pi.registerTool({ ...localWrite, execute: (id, params, signal, update) => remote && routeRemoteTools ? createWriteTool(localCwd, { operations: remoteWriteOps() }).execute(id, params, signal, update) : localWrite.execute(id, params, signal, update) });
   pi.registerTool({ ...localEdit, execute: (id, params, signal, update) => remote && routeRemoteTools ? createEditTool(localCwd, { operations: remoteEditOps() }).execute(id, params, signal, update) : localEdit.execute(id, params, signal, update) });
-  pi.registerTool({ ...localBash, execute: (id, params, signal, update) => remote && routeRemoteTools ? createBashTool(localCwd, { operations: remoteBashOps() }).execute(id, params, signal, update) : localBash.execute(id, params, signal, update) });
+  pi.registerTool({
+    ...localBash,
+    description: `Execute a shell command. Remote model-facing output returns at most the last ${DEFAULT_EXEC_MAX_LINES} lines or ${formatSize(DEFAULT_EXEC_MAX_BYTES)} by default; complete oversized output is saved locally.`,
+    promptGuidelines: ["When using bash for remote logs and broad searches, use bounded commands such as tail, sed, or rg with limits instead of cat or unbounded find output."],
+    execute: async (id, params, signal, update) => {
+      if (!remote || !routeRemoteTools) return localBash.execute(id, params, signal, update);
+      const result = await createBashTool(localCwd, { operations: remoteBashOps() }).execute(id, params, signal, update);
+      return limitRemoteToolResult(result, "exec");
+    },
+  });
 
   pi.registerTool({
     name: "ssh_remote_control",
     label: "SSH Remote Control",
-    description: "Connect, reconnect, annotate endpoints, manage server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Exec output uses a configurable collapsed preview (5 visual lines by default), while model output is limited to 50KB or 2000 lines and saved to a local temporary file when truncated. Passwords are never accepted as arguments and are cached only in process memory.",
+    description: "Connect, reconnect, annotate endpoints, manage server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords are never accepted as arguments and are cached only in process memory.",
     promptSnippet: "Control the configured remote SSH connection, endpoint note and memory, working directory, and local port forwarding",
     promptGuidelines: [
       "Use ssh_remote_control when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
       "Use ssh_remote_control with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
       `Always set timeout for ssh_remote_control remote exec commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
+      "Keep ssh_remote_control exec output narrow with tail, sed, rg limits, or similarly bounded commands; never cat large logs or emit broad file listings.",
       "Use ssh_remote_control with action disconnect after remote work when the user asks to return to the local environment.",
     ],
     parameters: Type.Object({
@@ -794,7 +1085,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
       remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
       timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_REMOTE_TIMEOUT_SECONDS, description: `Remote command timeout in seconds; defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS}` })),
-      displayLines: Type.Optional(Type.Integer({ minimum: 1, maximum: DEFAULT_MAX_LINES, description: "Collapsed visual lines for exec output; defaults to the /remote config display-lines setting (5 initially)" })),
+      displayLines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_DISPLAY_LINES, description: "Collapsed visual lines for exec output; defaults to the /remote config display-lines setting (5 initially), maximum 50" })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       if (params.action === "status") {
@@ -862,14 +1153,15 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         }
         const displayLines = parseDisplayLines(params.displayLines ?? configuredDisplayLines());
         const timeoutSeconds = parseRemoteTimeout(params.timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
-        const output = await withReconnect((client) => execRemote(
+        const limits = configuredOutputLimits();
+        const formatted = await withReconnect((client) => execRemoteLimited(
           client,
           `cd -- ${quote(params.cwd ?? state.cwd)} && ${params.remoteCommand}`,
-          false,
           timeoutSeconds,
+          limits.execMaxLines,
+          limits.execMaxBytes,
         ));
-        const formatted = formatRemoteOutput(output.toString());
-        return {
+        return limitRemoteToolResult({
           content: [{ type: "text", text: formatted.text }],
           details: {
             action: "exec",
@@ -877,10 +1169,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             cwd: state.cwd,
             displayLines,
             output: formatted.content,
+            modelLimited: true,
             truncation: formatted.truncation.truncated ? formatted.truncation : undefined,
             fullOutputPath: formatted.fullOutputPath,
           },
-        };
+        }, "exec");
       }
       const command = params.command || lastCommand || activeSshCommand();
       if (!command) throw new Error(`No SSH endpoint configured. Set ${REMOTE_CONFIG_FILE} or pass command.`);
@@ -894,7 +1187,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("remote", {
-    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config note TEXT|--clear | config memory TEXT|--clear | config cwd PATH | config display-lines N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
+    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config note TEXT|--clear | config memory TEXT|--clear | config cwd PATH | config display-lines N | config read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
     handler: async (args, ctx) => {
       const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
       const action = input.toLowerCase();
@@ -904,7 +1197,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           const active = key === config.activeEndpoint ? "*" : " ";
           return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    memory: ${endpoint.memory || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
         });
-        ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
+        const limits = configuredOutputLimits(config);
+        ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\nRead output: ${limits.readMaxLines} lines / ${formatSize(limits.readMaxBytes)}\nExec output: ${limits.execMaxLines} lines / ${formatSize(limits.execMaxBytes)}\nPer-turn output: ${formatSize(limits.turnMaxBytes)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
         return;
       }
       if (/^ssh\s+/i.test(input)) {
@@ -972,6 +1266,22 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         } catch (error) { ctx.ui.notify((error as Error).message, "error"); }
         return;
       }
+      const outputConfig = input.match(/^config\s+(read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes)\s+(\S+)$/i);
+      if (outputConfig) {
+        try {
+          const key = outputConfig[1]!.toLowerCase();
+          const value = outputConfig[2]!;
+          const config = loadRemoteConfig();
+          if (key === "read-max-lines") config.readMaxLines = parseOutputLines(value, "Read max lines");
+          else if (key === "read-max-bytes") config.readMaxBytes = parseOutputBytes(value, "Read max bytes");
+          else if (key === "exec-max-lines") config.execMaxLines = parseOutputLines(value, "Exec max lines");
+          else if (key === "exec-max-bytes") config.execMaxBytes = parseOutputBytes(value, "Exec max bytes");
+          else config.turnMaxBytes = parseOutputBytes(value, "Turn max bytes", DEFAULT_MAX_BYTES * 4);
+          saveRemoteConfig(config);
+          ctx.ui.notify(`SSH remote output limit updated: ${key}=${value}`, "info");
+        } catch (error) { ctx.ui.notify((error as Error).message, "error"); }
+        return;
+      }
       if (/^config\s+cwd\s+/i.test(input)) {
         const remoteCwd = input.replace(/^config\s+cwd\s+/i, "").trim();
         const command = lastCommand || activeSshCommand();
@@ -1022,13 +1332,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             else timeoutSeconds = parseRemoteTimeout(option[2]);
             execInput = option[3]!;
           }
-          const output = (await withReconnect((client) => execRemote(
+          const limits = configuredOutputLimits();
+          const formatted = await withReconnect((client) => execRemoteLimited(
             client,
             `cd -- ${quote(state.cwd)} && ${execInput}`,
-            false,
             timeoutSeconds,
-          ))).toString().trim();
-          const formatted = formatRemoteOutput(output);
+            limits.execMaxLines,
+            limits.execMaxBytes,
+          ));
           const preview = previewRemoteOutput(formatted.content, displayLines);
           const omitted = formatted.truncation.totalLines > displayLines
             ? `\n\n[Showing last ${Math.min(displayLines, formatted.truncation.totalLines)} of ${formatted.truncation.totalLines} lines]`
@@ -1064,6 +1375,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.on("turn_start", () => { turnOutputBytes = 0; });
   pi.on("session_start", async (event, ctx) => {
     currentCtx = ctx;
     status(ctx);

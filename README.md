@@ -35,7 +35,7 @@ Each `user@host:port` endpoint remembers its remote working directory, note, ser
 
 ### Resilient and bounded by default
 
-Dropped connections are automatically re-established during the active session. Remote commands have a 30-second default timeout, oversized output is bounded before it reaches the model context, and full truncated output is preserved in a temporary file.
+Dropped connections are automatically re-established during the active session. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges instead of downloading complete files, command output is streamed through bounded buffers, and a 32 KB per-turn budget prevents parallel tools from flooding model context. Complete oversized command output is preserved in a permission-restricted temporary file.
 
 ### Hybrid local/remote workflows
 
@@ -176,7 +176,12 @@ These requests are handled through the agent-facing `ssh_remote_control` tool; s
 | `/remote exec COMMAND` | Run one command in the remote cwd |
 | `/remote exec --timeout 60 COMMAND` | Override the command timeout |
 | `/remote exec --lines 20 COMMAND` | Override collapsed preview lines |
-| `/remote config display-lines 10` | Set default collapsed preview lines |
+| `/remote config display-lines 10` | Set default collapsed preview lines (maximum 50) |
+| `/remote config read-max-lines 400` | Set the remote read line budget |
+| `/remote config read-max-bytes 16384` | Set the remote read byte budget |
+| `/remote config exec-max-lines 200` | Set the remote command line budget |
+| `/remote config exec-max-bytes 8192` | Set the remote command byte budget |
+| `/remote config turn-max-bytes 32768` | Set the aggregate per-turn remote output budget |
 | `/remote status` | Show the active workspace |
 | `/remote reload` | Reconnect the active workspace |
 | `/remote off` | Disconnect and return tools to local execution |
@@ -190,9 +195,9 @@ Endpoint configuration is stored locally in:
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-Saved values include endpoints, active endpoint, notes, server-specific memories, remote working directories, forwards, and preview settings. Server memory is user-configured trusted context and is inserted into each model request only while that endpoint is the active remote workspace; it is not read from the remote server. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
+Saved values include endpoints, active endpoint, notes, server-specific memories, remote working directories, forwards, preview settings, and model-output budgets. Server memory is user-configured trusted context and is inserted into each model request only while that endpoint is the active remote workspace; it is not read from the remote server. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
 
-New or changed host keys require interactive confirmation and are stored separately from OpenSSH. Remote output sent to the model is limited to 2,000 lines or 50 KB; oversized complete output is written to a temporary local file. Preview-line settings affect only the collapsed UI.
+New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
 
 ## Current SSH scope
 
