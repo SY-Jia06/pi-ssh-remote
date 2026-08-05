@@ -48,7 +48,7 @@ interface RemoteState extends ParsedSsh {
 
 interface CredentialCache {
   passwords: Map<string, string>;
-  resume?: { command: string; cwd: string };
+  resume?: { command: string; cwd: string; routeRemoteTools: boolean; forwards?: string[] };
 }
 
 interface RemoteEndpointConfig {
@@ -80,6 +80,15 @@ interface ForwardSpec {
   remotePort: number;
 }
 
+interface SessionRemoteState {
+  version: 1;
+  connected: boolean;
+  command?: string;
+  cwd?: string;
+  routeRemoteTools?: boolean;
+  forwards?: string[];
+}
+
 const AGENT_DIR = join(process.env.HOME || ".", CONFIG_DIR_NAME, "agent");
 const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
 const REMOTE_CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
@@ -95,6 +104,7 @@ const MIN_MODEL_OUTPUT_BYTES = 1024;
 const OUTPUT_FOOTER_RESERVE_BYTES = 512;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
 const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
+const SESSION_STATE_ENTRY_TYPE = "pi-ssh-remote-state";
 const CACHE_KEY = "__piHpcCredentialCacheV1";
 const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
 const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>() };
@@ -659,6 +669,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   let currentCtx: any;
   let reconnectPromise: Promise<RemoteState> | null = null;
   const forwardServers = new Map<number, Server>();
+  const forwardSpecs = new Map<number, ForwardSpec>();
+  let sessionReady = false;
+  let restoringSessionState = false;
   let lastConnectionError: string | undefined;
   let lastCommand = credentialCache.resume?.command ?? activeSshCommand() ?? "";
   let turnOutputBytes = 0;
@@ -682,6 +695,42 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (normalized.startsWith("/")) return mapPath(normalized);
     if (!remote) return normalized;
     return posix.join(remote.cwd, normalized);
+  };
+
+  const serializeForward = (spec: ForwardSpec): string => `${spec.localPort}:${spec.remoteHost}:${spec.remotePort}`;
+
+  const currentSessionRemoteState = (): SessionRemoteState => remote ? {
+    version: 1,
+    connected: true,
+    command: remote.command,
+    cwd: remote.cwd,
+    routeRemoteTools,
+    forwards: [...forwardSpecs.values()].map(serializeForward),
+  } : { version: 1, connected: false };
+
+  const persistSessionRemoteState = (): void => {
+    if (!sessionReady || restoringSessionState) return;
+    pi.appendEntry(SESSION_STATE_ENTRY_TYPE, currentSessionRemoteState());
+  };
+
+  const loadSessionRemoteState = (ctx: any): SessionRemoteState | undefined => {
+    const branch = ctx.sessionManager.getBranch();
+    for (let index = branch.length - 1; index >= 0; index--) {
+      const entry = branch[index] as any;
+      if (entry.type !== "custom" || entry.customType !== SESSION_STATE_ENTRY_TYPE) continue;
+      const data = entry.data as Partial<SessionRemoteState> | undefined;
+      if (!data || data.version !== 1 || typeof data.connected !== "boolean") return undefined;
+      if (data.connected && (typeof data.command !== "string" || typeof data.cwd !== "string")) return undefined;
+      return {
+        version: 1,
+        connected: data.connected,
+        ...(data.command ? { command: data.command } : {}),
+        ...(data.cwd ? { cwd: data.cwd } : {}),
+        ...(typeof data.routeRemoteTools === "boolean" ? { routeRemoteTools: data.routeRemoteTools } : {}),
+        ...(Array.isArray(data.forwards) ? { forwards: data.forwards.filter((value): value is string => typeof value === "string") } : {}),
+      };
+    }
+    return undefined;
   };
 
   const limitRemoteToolResult = (result: any, kind: "read" | "exec", startLine = 1, requestedMaxLines?: number) => {
@@ -772,6 +821,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   async function reconnectRemote(): Promise<RemoteState> {
     if (reconnectPromise) return reconnectPromise;
+    const resumeRouting = remote ? routeRemoteTools : (credentialCache.resume?.routeRemoteTools ?? true);
     const source = remote ?? (credentialCache.resume ? { ...parseSshCommand(credentialCache.resume.command), cwd: credentialCache.resume.cwd } : null);
     if (!source) throw new Error("No SSH remote connection is available to reconnect");
     const parsed = parseSshCommand(source.command);
@@ -780,7 +830,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       const oldClient = remote?.client;
       const next = await establish(parsed, password, source.cwd);
       remote = next;
-      credentialCache.resume = { command: parsed.command, cwd: next.cwd };
+      routeRemoteTools = resumeRouting;
+      credentialCache.resume = { command: parsed.command, cwd: next.cwd, routeRemoteTools, forwards: credentialCache.resume?.forwards };
       oldClient?.end();
       if (currentCtx) {
         status(currentCtx);
@@ -810,9 +861,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       `cd -- ${quote(remote!.cwd)} && ${targetCommand} && pwd -P`,
     ))).toString().trim();
     remote.cwd = resolved;
-    credentialCache.resume = { command: remote.command, cwd: resolved };
+    credentialCache.resume = { command: remote.command, cwd: resolved, routeRemoteTools, forwards: [...forwardSpecs.values()].map(serializeForward) };
     saveEndpointConfig(remote.command, { remoteCwd: resolved }, true);
     status(ctx);
+    persistSessionRemoteState();
     return resolved;
   };
 
@@ -874,11 +926,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       routeRemoteTools = true;
       previous?.end();
       if (password) setCachedPassword(parsed, password);
-      credentialCache.resume = { command, cwd: next.cwd };
+      credentialCache.resume = { command, cwd: next.cwd, routeRemoteTools, forwards: [] };
       lastCommand = command;
       lastConnectionError = undefined;
       saveEndpointConfig(command, { remoteCwd: next.cwd }, true);
       status(ctx);
+      persistSessionRemoteState();
       ctx.ui.notify(`SSH remote connected: ${endpointDisplayLabel(next)}:${next.cwd}`, "info");
       return next;
     } catch (error) {
@@ -922,12 +975,30 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       });
     });
     forwardServers.set(spec.localPort, server);
+    forwardSpecs.set(spec.localPort, spec);
   };
 
   const stopForwards = async (): Promise<void> => {
     const servers = [...forwardServers.values()];
     forwardServers.clear();
+    forwardSpecs.clear();
     await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  };
+
+  const restoreSessionRemoteState = async (saved: SessionRemoteState, ctx: any): Promise<void> => {
+    if (!saved.connected) {
+      credentialCache.resume = undefined;
+      status(ctx);
+      return;
+    }
+    const command = saved.command!;
+    const next = await connectInteractive(command, ctx, saved.cwd);
+    if (!next) throw new Error(lastConnectionError || "SSH remote session restore was cancelled or failed");
+    routeRemoteTools = saved.routeRemoteTools ?? true;
+    const specs = (saved.forwards ?? []).map(parseForwardSpec);
+    for (const spec of specs) await startForward(spec);
+    credentialCache.resume = { command, cwd: next.cwd, routeRemoteTools, forwards: [...forwardSpecs.values()].map(serializeForward) };
+    status(ctx);
   };
 
   const disconnect = (ctx: any, forgetPassword = false) => {
@@ -948,6 +1019,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
     previous?.client.end();
     status(ctx);
+    persistSessionRemoteState();
     ctx.ui.notify(forgetPassword ? "SSH remote disconnected and cached password cleared" : "SSH remote mode disabled (password remains cached in memory only)", "info");
   };
 
@@ -1104,6 +1176,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       }
       if (params.action === "unforward") {
         await stopForwards();
+        persistSessionRemoteState();
         return { content: [{ type: "text", text: "Closed all extension-managed SSH port forwards." }], details: { forwardedPorts: [] } };
       }
       if (params.action === "forward") {
@@ -1113,7 +1186,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const specs = values.map(parseForwardSpec);
         for (const spec of specs) await startForward(spec);
         routeRemoteTools = false;
+        credentialCache.resume = { command: state.command, cwd: state.cwd, routeRemoteTools, forwards: [...forwardSpecs.values()].map(serializeForward) };
         if (currentCtx) status(currentCtx);
+        persistSessionRemoteState();
         const ports = specs.map((spec) => spec.localPort);
         return { content: [{ type: "text", text: `Forwarded local ports: ${ports.join(", ")}; tools remain local.` }], details: { toolRouting: "local", forwardedPorts: ports } };
       }
@@ -1231,6 +1306,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           previous.client.end();
           await stopForwards();
           status(ctx);
+          persistSessionRemoteState();
         }
         saveRemoteConfig({ ...config, activeEndpoint: key });
         lastCommand = command;
@@ -1309,13 +1385,16 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           const specs = values.map(parseForwardSpec);
           for (const spec of specs) await startForward(spec);
           routeRemoteTools = false;
+          credentialCache.resume = { command: state.command, cwd: state.cwd, routeRemoteTools, forwards: [...forwardSpecs.values()].map(serializeForward) };
           status(ctx);
+          persistSessionRemoteState();
           ctx.ui.notify(`SSH remote port forwarding started; tools remain local in ${localCwd}: ${specs.map((spec) => `127.0.0.1:${spec.localPort}`).join(", ")}`, "info");
         } catch (error) { ctx.ui.notify(`SSH remote port forwarding failed: ${(error as Error).message}`, "error"); }
         return;
       }
       if (action === "unforward") {
         await stopForwards();
+        persistSessionRemoteState();
         ctx.ui.notify("Closed all extension-managed SSH remote port forwards", "info");
         return;
       }
@@ -1378,19 +1457,50 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.on("turn_start", () => { turnOutputBytes = 0; });
   pi.on("session_start", async (event, ctx) => {
     currentCtx = ctx;
+    sessionReady = true;
     status(ctx);
-    if (event.reason === "reload" && credentialCache.resume) {
-      try { await reconnectRemote(); }
-      catch (error) { ctx.ui.notify(`SSH remote automatic login after reload failed: ${(error as Error).message}`, "error"); }
+    const saved = loadSessionRemoteState(ctx);
+    const canInheritCurrent = event.reason === "reload" || event.reason === "new" || event.reason === "fork";
+    const inherited = !saved && canInheritCurrent && credentialCache.resume ? credentialCache.resume : undefined;
+    const target: SessionRemoteState | undefined = saved ?? (inherited ? {
+      version: 1,
+      connected: true,
+      command: inherited.command,
+      cwd: inherited.cwd,
+      routeRemoteTools: inherited.routeRemoteTools,
+      forwards: inherited.forwards ?? [],
+    } : undefined);
+    if (!target) {
+      credentialCache.resume = undefined;
+      return;
     }
+    restoringSessionState = true;
+    try {
+      await restoreSessionRemoteState(target, ctx);
+    } catch (error) {
+      ctx.ui.notify(`SSH remote session restore failed: ${(error as Error).message}`, "error");
+    } finally {
+      restoringSessionState = false;
+    }
+    if (inherited && remote) persistSessionRemoteState();
   });
-  pi.on("session_shutdown", (event) => {
+  pi.on("session_shutdown", async (event) => {
+    sessionReady = false;
     const previous = remote;
+    const preserveConnection = event.reason === "reload" || event.reason === "new" || event.reason === "fork";
+    if (previous && preserveConnection) {
+      credentialCache.resume = {
+        command: previous.command,
+        cwd: previous.cwd,
+        routeRemoteTools,
+        forwards: [...forwardSpecs.values()].map(serializeForward),
+      };
+    }
     remote = null;
     routeRemoteTools = false;
-    void stopForwards();
+    await stopForwards();
     previous?.client.end();
-    if (event.reason !== "reload") credentialCache.resume = undefined;
+    if (!preserveConnection) credentialCache.resume = undefined;
   });
   pi.on("user_bash", async (event, ctx) => {
     if (!remote || !routeRemoteTools) return undefined;

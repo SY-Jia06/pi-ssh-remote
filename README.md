@@ -35,7 +35,7 @@ Each `user@host:port` endpoint remembers its remote working directory, note, ser
 
 ### Resilient and bounded by default
 
-Dropped connections are automatically re-established during the active session. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges instead of downloading complete files, command output is streamed through bounded buffers, and a 32 KB per-turn budget prevents parallel tools from flooding model context. Complete oversized command output is preserved in a permission-restricted temporary file.
+Dropped connections are automatically re-established during the active session. SSH workspace state is also session-aware: `/new` inherits the current workspace, forks and clones retain their source workspace, and `/resume` restores the selected session's recorded endpoint, remote directory, routing mode, and forwards. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges instead of downloading complete files, command output is streamed through bounded buffers, and a 32 KB per-turn budget prevents parallel tools from flooding model context. Complete oversized command output is preserved in a permission-restricted temporary file.
 
 ### Hybrid local/remote workflows
 
@@ -195,7 +195,7 @@ Endpoint configuration is stored locally in:
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-Saved values include endpoints, active endpoint, notes, server-specific memories, remote working directories, forwards, preview settings, and model-output budgets. Server memory is user-configured trusted context and is inserted into each model request only while that endpoint is the active remote workspace; it is not read from the remote server. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
+Saved global values include endpoints, active endpoint, notes, server-specific memories, remote working directories, forwards, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Server memory is user-configured trusted context and is inserted into each model request only while that endpoint is the active remote workspace; it is not read from the remote server. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
 
 New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
 

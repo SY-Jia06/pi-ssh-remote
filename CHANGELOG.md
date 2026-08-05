@@ -16,6 +16,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 - Remote text reads now default to 400 lines or 16 KB, remote command results default to the last 200 lines or 8 KB, and each agent turn defaults to a shared 32 KB remote output budget.
 - Remote command output now streams through bounded buffers, with complete oversized stdout written to a permission-restricted local temporary file.
 - Collapsed command previews are now limited to at most 50 visual lines and remain independent from model-facing output.
+- SSH workspace state is now session-aware: `/new` inherits the current connection, forks and clones retain their source workspace, and `/resume` restores the selected session's endpoint, remote directory, routing mode, and forwards.
 - Moved the complete release history into this changelog and kept concise release indexes in the English and Chinese READMEs.
 
 ### Fixed
