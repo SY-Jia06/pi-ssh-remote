@@ -27,7 +27,7 @@ Once connected, Pi's file tools, shell tool, and `!` user shell commands are tra
 
 ### Agent control plane, human control plane
 
-The extension exposes `ssh_remote_control` for the agent and `/remote` for the user. You can ask Pi to connect, inspect status, change directory, add a server note, execute a command, create a tunnel, or return to local work in natural language—and still take direct control whenever you want.
+The extension exposes `remote` for the agent and `/remote` for the user. You can ask Pi to connect, inspect status, change directory, add a server note, execute a command, create a tunnel, or return to local work in natural language—and still take direct control whenever you want.
 
 ### Stateful endpoints instead of disposable SSH commands
 
@@ -154,7 +154,7 @@ Forward the remote service on port 8000 to localhost:8000, but keep my coding
 tools on the local repository.
 ```
 
-These requests are handled through the agent-facing `ssh_remote_control` tool; slash commands are optional.
+These requests are handled through the agent-facing `remote` tool; slash commands are optional.
 
 ## Command reference
 

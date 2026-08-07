@@ -323,7 +323,7 @@ function endpointMemory(endpoint: ParsedSsh, config = loadRemoteConfig()): strin
 function remoteSystemPrompt(systemPrompt: string, localCwd: string, remote: RemoteState): string {
   return systemPrompt.replace(
     `Current working directory: ${localCwd}`,
-    `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All read, write, edit, bash, and user shell operations run on this remote server. Use ssh_remote_control with action disconnect to return to the local environment when requested.`,
+    `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All read, write, edit, bash, and user shell operations run on this remote server. Use remote with action disconnect to return to the local environment when requested.`,
   );
 }
 
@@ -1137,16 +1137,16 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "ssh_remote_control",
-    label: "SSH Remote Control",
+    name: "remote",
+    label: "Remote",
     description: "Connect, reconnect, annotate endpoints, manage server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords are never accepted as arguments and are cached only in process memory.",
     promptSnippet: "Control the configured remote SSH connection, endpoint note and memory, working directory, and local port forwarding",
     promptGuidelines: [
-      "Use ssh_remote_control when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
-      "Use ssh_remote_control with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
-      `Always set timeout for ssh_remote_control remote exec commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
-      "Keep ssh_remote_control exec output narrow with tail, sed, rg limits, or similarly bounded commands; never cat large logs or emit broad file listings.",
-      "Use ssh_remote_control with action disconnect after remote work when the user asks to return to the local environment.",
+      "Use remote when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
+      "Use remote with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
+      `Always set timeout for remote exec commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
+      "Keep remote exec output narrow with tail, sed, rg limits, or similarly bounded commands; never cat large logs or emit broad file listings.",
+      "Use remote with action disconnect after remote work when the user asks to return to the local environment.",
     ],
     parameters: Type.Object({
       action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "memory"] as const),

@@ -208,7 +208,7 @@ pi install npm:pi-ssh-remote
 把远端 8000 端口转发到本地 8000，但代码工具继续留在本地。
 ```
 
-Pi 会通过插件提供的 `ssh_remote_control` 工具完成这些操作。
+Pi 会通过插件提供的 `remote` 工具完成这些操作。
 
 ## 命令说明
 

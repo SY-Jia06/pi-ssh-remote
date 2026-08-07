@@ -12,7 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Changed
 
-- None.
+- Renamed the agent-facing `ssh_remote_control` tool to the shorter `remote` name, matching the `/remote` command.
 
 ### Fixed
 
