@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 ### Changed
 
 - Renamed the agent-facing `ssh_remote_control` tool to the shorter `remote` name, matching the `/remote` command.
+- Server memory is now keyed by `user@host` and shared across SSH ports; existing endpoint memories are migrated automatically.
 
 ### Fixed
 

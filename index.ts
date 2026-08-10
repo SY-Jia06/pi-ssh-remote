@@ -56,12 +56,14 @@ interface RemoteEndpointConfig {
   remoteCwd?: string;
   forwards?: string[];
   note?: string;
+  /** Legacy field migrated into serverMemories on the next config write. */
   memory?: string;
 }
 
 interface RemoteConfig {
   activeEndpoint?: string;
   endpoints?: Record<string, RemoteEndpointConfig>;
+  serverMemories?: Record<string, string>;
   displayLines?: number;
   readMaxLines?: number;
   readMaxBytes?: number;
@@ -154,6 +156,10 @@ function cacheId(config: ParsedSsh): string {
   return `${config.username}@${config.host}:${config.port}`;
 }
 
+function serverMemoryId(config: ParsedSsh): string {
+  return `${config.username}@${config.host}`;
+}
+
 function getCachedPassword(config: ParsedSsh): string | undefined {
   return credentialCache.passwords.get(cacheId(config));
 }
@@ -241,11 +247,25 @@ function commandFromEndpointKey(key: string): string | undefined {
 
 function normalizeRemoteConfig(config: RemoteConfig): RemoteConfig {
   const endpoints = { ...(config.endpoints ?? {}) };
-  for (const [key, endpoint] of Object.entries(endpoints)) {
+  const serverMemories = Object.fromEntries(
+    Object.entries(config.serverMemories ?? {})
+      .filter((entry): entry is [string, string] => typeof entry[1] === "string" && Boolean(entry[1].trim()))
+      .map(([key, memory]) => [key, memory.trim()]),
+  );
+  const endpointEntries = Object.entries(endpoints).sort(([left], [right]) =>
+    left === config.activeEndpoint ? -1 : right === config.activeEndpoint ? 1 : 0,
+  );
+  for (const [key, endpoint] of endpointEntries) {
+    const command = endpoint.sshCommand || commandFromEndpointKey(key);
+    const { memory: legacyMemory, ...endpointWithoutMemory } = endpoint;
     endpoints[key] = {
-      ...endpoint,
-      ...(endpoint.sshCommand ? {} : { sshCommand: commandFromEndpointKey(key) }),
+      ...endpointWithoutMemory,
+      ...(command ? { sshCommand: command } : {}),
     };
+    if (legacyMemory?.trim() && command) {
+      try { serverMemories[serverMemoryId(parseSshCommand(command))] ??= legacyMemory.trim(); }
+      catch {}
+    }
   }
 
   let activeEndpoint = config.activeEndpoint;
@@ -279,6 +299,7 @@ function normalizeRemoteConfig(config: RemoteConfig): RemoteConfig {
   return {
     ...(activeEndpoint ? { activeEndpoint } : {}),
     ...(Object.keys(endpoints).length ? { endpoints } : {}),
+    ...(Object.keys(serverMemories).length ? { serverMemories } : {}),
     ...(displayLines !== undefined ? { displayLines } : {}),
     ...(readMaxLines !== undefined ? { readMaxLines } : {}),
     ...(readMaxBytes !== undefined ? { readMaxBytes } : {}),
@@ -317,7 +338,7 @@ function endpointDisplayLabel(endpoint: ParsedSsh, config = loadRemoteConfig()):
 }
 
 function endpointMemory(endpoint: ParsedSsh, config = loadRemoteConfig()): string | undefined {
-  return endpointConfig(config, endpoint.command).memory?.trim() || undefined;
+  return config.serverMemories?.[serverMemoryId(endpoint)]?.trim() || undefined;
 }
 
 function remoteSystemPrompt(systemPrompt: string, localCwd: string, remote: RemoteState): string {
@@ -342,6 +363,24 @@ function saveEndpointConfig(command: string, updates: RemoteEndpointConfig, make
     endpoints: {
       ...(config.endpoints ?? {}),
       [key]: { ...endpointConfig(config, command), sshCommand: command, ...updates },
+    },
+  });
+}
+
+function saveServerMemory(command: string, memory: string | undefined): void {
+  const config = loadRemoteConfig();
+  const parsed = parseSshCommand(command);
+  const endpointKey = cacheId(parsed);
+  const memoryKey = serverMemoryId(parsed);
+  const serverMemories = { ...(config.serverMemories ?? {}) };
+  if (memory) serverMemories[memoryKey] = memory;
+  else delete serverMemories[memoryKey];
+  saveRemoteConfig({
+    ...config,
+    serverMemories,
+    endpoints: {
+      ...(config.endpoints ?? {}),
+      [endpointKey]: { ...endpointConfig(config, command), sshCommand: command },
     },
   });
 }
@@ -1152,7 +1191,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "memory"] as const),
       command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22; optionally selects the endpoint for note or memory" })),
       note: Type.Optional(Type.String({ description: "Endpoint note for the note action; omit or use an empty string to clear it" })),
-      memory: Type.Optional(Type.String({ description: "Persistent server-specific context for the memory action; omit or use an empty string to clear it" })),
+      memory: Type.Optional(Type.String({ description: "Persistent context shared by the endpoint's user@host across SSH ports; omit or use an empty string to clear it" })),
       cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
       remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
@@ -1212,10 +1251,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           };
         }
         const memory = params.memory?.trim() || undefined;
-        saveEndpointConfig(command, { memory });
+        const server = serverMemoryId(parseSshCommand(command));
+        saveServerMemory(command, memory);
         return {
-          content: [{ type: "text", text: memory ? `SSH remote server memory updated (${label}). It will be injected while this endpoint is the active remote workspace.` : `SSH remote server memory cleared (${label}).` }],
-          details: { endpoint: label, memory },
+          content: [{ type: "text", text: memory ? `SSH remote server memory updated (${server}). It applies to every port for this user and host.` : `SSH remote server memory cleared (${server}).` }],
+          details: { endpoint: label, server, memory },
         };
       }
       if (params.action === "exec") {
@@ -1270,7 +1310,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const config = loadRemoteConfig();
         const rows = Object.entries(config.endpoints ?? {}).map(([key, endpoint]) => {
           const active = key === config.activeEndpoint ? "*" : " ";
-          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    memory: ${endpoint.memory || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
+          const command = endpoint.sshCommand || commandFromEndpointKey(key);
+          const memory = command ? endpointMemory(parseSshCommand(command), config) : undefined;
+          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    memory: ${memory || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
         });
         const limits = configuredOutputLimits(config);
         ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\nRead output: ${limits.readMaxLines} lines / ${formatSize(limits.readMaxBytes)}\nExec output: ${limits.execMaxLines} lines / ${formatSize(limits.execMaxBytes)}\nPer-turn output: ${formatSize(limits.turnMaxBytes)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
@@ -1330,8 +1372,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const command = lastCommand || activeSshCommand();
         if (!command) { ctx.ui.notify("Configure an SSH endpoint first", "error"); return; }
         const memory = value.toLowerCase() === "--clear" ? undefined : value;
-        saveEndpointConfig(command, { memory });
-        ctx.ui.notify(memory ? `SSH remote server memory updated (${parseSshCommand(command).label}); it will be injected while connected` : `SSH remote server memory cleared (${parseSshCommand(command).label})`, "info");
+        const server = serverMemoryId(parseSshCommand(command));
+        saveServerMemory(command, memory);
+        ctx.ui.notify(memory ? `SSH remote server memory updated (${server}); it applies to every port` : `SSH remote server memory cleared (${server})`, "info");
         return;
       }
       if (/^config\s+display-lines\s+/i.test(input)) {

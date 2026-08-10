@@ -54,7 +54,7 @@ SSH remote H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 - 服务器特定记忆；
 - 端口转发配置。
 
-例如可以把几台机器分别备注为 `8xH100 训练机`、`预发布环境`、`线上只读机`。还可以为每个 `user@host:port` 保存独立记忆，例如指定 Python 环境、共享任务保护规则或部署约定。连接该 endpoint 并启用远端工具路由后，这段记忆会自动注入模型上下文；断开连接或切换到纯隧道模式后，后续请求不再注入。所有配置保存在本地，重启 Pi 后仍然存在。
+例如可以把几台机器分别备注为 `8xH100 训练机`、`预发布环境`、`线上只读机`。服务器记忆按 `user@host` 保存，例如指定 Python 环境、共享任务保护规则或部署约定；同一用户和主机即使通过不同 SSH 端口连接，也会使用同一份记忆。连接匹配的 endpoint 并启用远端工具路由后，这段记忆会自动注入模型上下文；断开连接或切换到纯隧道模式后，后续请求不再注入。所有配置保存在本地，重启 Pi 后仍然存在。
 
 ### 断线后可以自动恢复
 
@@ -173,7 +173,7 @@ pi install npm:pi-ssh-remote
 /remote
 ```
 
-备注和默认目录会按 `user@host:port` 分别保存，不会互相覆盖。
+备注和默认目录会按 `user@host:port` 分别保存，不会互相覆盖；服务器记忆则按 `user@host` 共享，不受端口影响。
 
 ### 4. 远端启动模型，本地开发界面
 
@@ -220,8 +220,8 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。
 | `/remote use USER@HOST:PORT` | 切换到指定服务器 |
 | `/remote config note TEXT` | 给当前服务器添加或修改备注 |
 | `/remote config note --clear` | 清除当前服务器备注 |
-| `/remote config memory TEXT` | 保存连接该服务器时自动注入上下文的记忆 |
-| `/remote config memory --clear` | 清除当前服务器的特定记忆 |
+| `/remote config memory TEXT` | 保存当前 `user@host` 的记忆，并在不同端口间共享 |
+| `/remote config memory --clear` | 清除当前 `user@host` 的记忆 |
 | `/remote config cwd PATH` | 设置默认远程工作目录 |
 | `/remote cd PATH` | 切换当前远程目录并保存 |
 | `/remote config forward MAPPING...` | 保存端口转发配置，例如 `7860:127.0.0.1:7860` |
@@ -260,7 +260,7 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。
 - 命令预览设置；
 - 模型输出预算。
 
-此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。服务器记忆是由用户在本地配置的可信上下文，不会从远程服务器自动读取；仅当对应 endpoint 作为远端工作区启用时才会加入每次模型请求。
+此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。服务器记忆按 `user@host` 识别，不受 SSH 端口影响。它是由用户在本地配置的可信上下文，不会从远程服务器自动读取；仅当匹配的 endpoint 作为远端工作区启用时才会加入每次模型请求。
 
 密码不会写入配置文件。插件会优先使用 SSH agent；如果需要手动输入密码，密码只会缓存在当前 Pi 进程的内存中。
 

@@ -31,7 +31,7 @@ The extension exposes `remote` for the agent and `/remote` for the user. You can
 
 ### Stateful endpoints instead of disposable SSH commands
 
-Each `user@host:port` endpoint remembers its remote working directory, note, server-specific memory, and port-forward configuration locally. Notes such as `H100 training`, `staging`, or `customer demo` appear in configuration, status messages, and Pi's footer, so the active execution environment stays visible. Server memory is automatically injected into the model context whenever that endpoint is connected as the active remote workspace.
+Each `user@host:port` endpoint remembers its remote working directory, note, and port-forward configuration locally. Server memory is shared by `user@host`, so connecting as the same user to the same host through another port uses the same memory. Notes such as `H100 training`, `staging`, or `customer demo` appear in configuration, status messages, and Pi's footer, so the active execution environment stays visible. Server memory is automatically injected into the model context whenever a matching endpoint is connected as the active remote workspace.
 
 ### Resilient and bounded by default
 
@@ -121,7 +121,7 @@ The default foreground timeout prevents an accidental long-running command from 
 /remote
 ```
 
-Endpoint notes, working directories, and server-specific memories survive Pi restarts because they are stored in the local remote configuration. When Pi connects to an endpoint, its memory is added to the system context on every agent run while remote tool routing remains active. Disconnecting or switching to tunnel-only mode removes it from subsequent model requests.
+Endpoint notes and working directories, plus `user@host`-specific server memories, survive Pi restarts because they are stored in the local remote configuration. When Pi connects to an endpoint, the memory matching its user and host is added to the system context on every agent run while remote tool routing remains active; the SSH port does not affect memory selection. Disconnecting or switching to tunnel-only mode removes it from subsequent model requests.
 
 ### 4. Expose a remote service while editing locally
 
@@ -166,8 +166,8 @@ These requests are handled through the agent-facing `remote` tool; slash command
 | `/remote use USER@HOST:PORT` | Select a saved endpoint |
 | `/remote config note TEXT` | Persist a note for the selected endpoint |
 | `/remote config note --clear` | Clear its note |
-| `/remote config memory TEXT` | Persist context that is injected while working on this endpoint |
-| `/remote config memory --clear` | Clear its server-specific memory |
+| `/remote config memory TEXT` | Persist context for the current `user@host`, shared across ports |
+| `/remote config memory --clear` | Clear the current `user@host` memory |
 | `/remote config cwd PATH` | Persist its default remote working directory |
 | `/remote cd PATH` | Change the connected remote cwd and persist it |
 | `/remote config forward MAPPING...` | Persist port forwards such as `7860:127.0.0.1:7860` |
@@ -195,7 +195,7 @@ Endpoint configuration is stored locally in:
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-Saved global values include endpoints, active endpoint, notes, server-specific memories, remote working directories, forwards, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Server memory is user-configured trusted context and is inserted into each model request only while that endpoint is the active remote workspace; it is not read from the remote server. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
+Saved global values include endpoints, active endpoint, notes, `user@host`-specific server memories, remote working directories, forwards, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Server memory is user-configured trusted context and is inserted into each model request only while a matching endpoint is the active remote workspace; it is not read from the remote server. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
 
 New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
 
