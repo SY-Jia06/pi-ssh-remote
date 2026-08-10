@@ -12,7 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Changed
 
-- None.
+- Removed the redundant `SSH remote` prefix from footer status labels.
 
 ### Fixed
 

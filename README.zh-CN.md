@@ -39,7 +39,7 @@ ssh user@host "cd /path && ..."
 插件会把当前远程目录和服务器信息写入 Pi 的上下文，并显示在底部状态栏：
 
 ```text
-SSH remote H100 训练机 (root@gpu-box.example.com:2202):/srv/project
+H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 ```
 
 这样无论是用户还是 Agent，都能随时确认当前操作发生在本地还是远端，减少误操作。

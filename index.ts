@@ -931,8 +931,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const status = (ctx: any) => {
     currentCtx = ctx;
     if (!remote) ctx.ui.setStatus("ssh-remote", undefined);
-    else if (routeRemoteTools) ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH remote ${endpointDisplayLabel(remote)}:${remote.cwd}`));
-    else ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH remote tunnel ${[...forwardServers.keys()].join(",") || endpointDisplayLabel(remote)}`));
+    else if (routeRemoteTools) ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `${endpointDisplayLabel(remote)}:${remote.cwd}`));
+    else ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `tunnel ${[...forwardServers.keys()].join(",") || endpointDisplayLabel(remote)}`));
   };
 
   const attachClient = (state: RemoteState) => {
@@ -940,7 +940,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     client.on("close", () => {
       if (remote?.client !== client) return;
       if (currentCtx) {
-        currentCtx.ui.setStatus("ssh-remote", currentCtx.ui.theme.fg("warning", `SSH remote reconnecting ${endpointDisplayLabel(state)}…`));
+        currentCtx.ui.setStatus("ssh-remote", currentCtx.ui.theme.fg("warning", `reconnecting ${endpointDisplayLabel(state)}…`));
       }
       void reconnectRemote().catch((error) => {
         if (currentCtx) currentCtx.ui.notify(`SSH remote automatic reconnection failed: ${(error as Error).message}`, "error");
@@ -1055,7 +1055,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
 
     let password = getCachedPassword(parsed);
-    ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `SSH remote connecting ${endpointDisplayLabel(parsed)}…`));
+    ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `connecting ${endpointDisplayLabel(parsed)}…`));
     try {
       let authentication = parsed.identityFile
         ? await privateKeyAuthentication(parsed, ctx)

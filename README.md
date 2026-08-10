@@ -73,7 +73,7 @@ Requires Node.js 20+. The remote server must provide Bash, SFTP, and GNU `timeou
 From this point, normal Pi operations target `/srv/project` on the remote server. The footer makes that routing explicit:
 
 ```text
-SSH remote H100 training server (root@gpu-box.example.com:2202):/srv/project
+H100 training server (root@gpu-box.example.com:2202):/srv/project
 ```
 
 Return to local tools with:
