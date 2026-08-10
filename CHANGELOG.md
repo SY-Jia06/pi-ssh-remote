@@ -12,8 +12,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Changed
 
+- None.
+
+### Fixed
+
+- None.
+
+## [0.1.8] - 2026-08-10
+
+### Added
+
+- Added explicit private-key authentication through `ssh -i KEY`, including passphrase-protected keys and in-memory passphrase caching for reconnects.
+
+### Changed
+
 - Renamed the agent-facing `ssh_remote_control` tool to the shorter `remote` name, matching the `/remote` command.
 - Server memory is now keyed by `user@host` and shared across SSH ports; existing endpoint memories are migrated automatically.
+- `/remote forget` now clears cached private-key passphrases as well as passwords.
 
 ### Fixed
 
@@ -146,7 +161,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.4...v0.1.5

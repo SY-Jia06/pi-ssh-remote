@@ -6,9 +6,9 @@
  * credentials, remote working directories, reconnection, and TCP forwarding.
  */
 
-import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import { dirname, join, posix, relative, sep } from "node:path";
+import ssh2, { type Client as SshClient, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, join, posix, relative, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { Type } from "typebox";
@@ -33,21 +33,25 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
 
+const { Client, utils: ssh2Utils } = ssh2;
+
 interface ParsedSsh {
   host: string;
   port: number;
   username: string;
+  identityFile?: string;
   label: string;
   command: string;
 }
 
 interface RemoteState extends ParsedSsh {
-  client: Client;
+  client: SshClient;
   cwd: string;
 }
 
 interface CredentialCache {
   passwords: Map<string, string>;
+  keyPassphrases: Map<string, string>;
   resume?: { command: string; cwd: string; routeRemoteTools: boolean; forwards?: string[] };
 }
 
@@ -106,10 +110,12 @@ const MIN_MODEL_OUTPUT_BYTES = 1024;
 const OUTPUT_FOOTER_RESERVE_BYTES = 512;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
 const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
+const MAX_PRIVATE_KEY_BYTES = 1024 * 1024;
 const SESSION_STATE_ENTRY_TYPE = "pi-ssh-remote-state";
 const CACHE_KEY = "__piHpcCredentialCacheV1";
 const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
-const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>() };
+const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>(), keyPassphrases: new Map<string, string>() };
+credentialCache.keyPassphrases ??= new Map<string, string>();
 
 function shellWords(input: string): string[] {
   const words: string[] = [];
@@ -134,22 +140,37 @@ function parseSshCommand(command: string): ParsedSsh {
   if (args[0] !== "ssh") throw new Error("Command must start with ssh, for example: ssh root@host -p 22");
   let port = 22;
   let username = process.env.USER || "root";
+  let identityFile: string | undefined;
   let target: string | undefined;
   for (let i = 1; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === "-p") { port = Number(args[++i]); continue; }
     if (arg.startsWith("-p") && arg.length > 2) { port = Number(arg.slice(2)); continue; }
     if (arg === "-l") { username = args[++i] || username; continue; }
-    if (arg.startsWith("-")) throw new Error(`Unsupported SSH option ${arg}; only -p and -l are currently supported`);
+    if (arg === "-i") {
+      if (identityFile !== undefined) throw new Error("Only one SSH identity file may be specified");
+      identityFile = args[++i];
+      if (!identityFile) throw new Error("SSH option -i requires a private key path");
+      continue;
+    }
+    if (arg.startsWith("-i") && arg.length > 2) {
+      if (identityFile !== undefined) throw new Error("Only one SSH identity file may be specified");
+      identityFile = arg.slice(2);
+      continue;
+    }
+    if (arg.startsWith("-")) throw new Error(`Unsupported SSH option ${arg}; only -p, -l, and -i are currently supported`);
     if (!target) target = arg;
     else throw new Error("Unexpected extra argument in SSH command");
   }
   if (!target || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid SSH host or port");
+  if (identityFile && identityFile !== "~" && !identityFile.startsWith("~/") && !isAbsolute(identityFile)) {
+    throw new Error("SSH identity file must use an absolute path or ~/...");
+  }
   const at = target.lastIndexOf("@");
   const host = at >= 0 ? target.slice(at + 1) : target;
   if (at >= 0) username = target.slice(0, at);
   if (!host || !username) throw new Error("Invalid SSH username or host");
-  return { host, port, username, label: `${username}@${host}:${port}`, command };
+  return { host, port, username, ...(identityFile ? { identityFile } : {}), label: `${username}@${host}:${port}`, command };
 }
 
 function cacheId(config: ParsedSsh): string {
@@ -170,6 +191,60 @@ function setCachedPassword(config: ParsedSsh, password: string): void {
 
 function deleteCachedPassword(config: ParsedSsh): void {
   credentialCache.passwords.delete(cacheId(config));
+}
+
+function resolveIdentityPath(config: ParsedSsh): string {
+  if (!config.identityFile) throw new Error("No SSH identity file is configured");
+  if (config.identityFile === "~" || config.identityFile.startsWith("~/")) {
+    const home = process.env.HOME;
+    if (!home) throw new Error("Cannot expand SSH identity path because HOME is not set");
+    return config.identityFile === "~" ? home : join(home, config.identityFile.slice(2));
+  }
+  return config.identityFile;
+}
+
+function keyPassphraseId(config: ParsedSsh): string {
+  return `${cacheId(config)}|${resolveIdentityPath(config)}`;
+}
+
+function getCachedKeyPassphrase(config: ParsedSsh): string | undefined {
+  return credentialCache.keyPassphrases.get(keyPassphraseId(config));
+}
+
+function setCachedKeyPassphrase(config: ParsedSsh, passphrase: string): void {
+  credentialCache.keyPassphrases.set(keyPassphraseId(config), passphrase);
+}
+
+function deleteCachedKeyPassphrase(config: ParsedSsh): void {
+  if (config.identityFile) credentialCache.keyPassphrases.delete(keyPassphraseId(config));
+}
+
+function readPrivateKey(config: ParsedSsh): Buffer {
+  const path = resolveIdentityPath(config);
+  let stat;
+  try { stat = statSync(path); }
+  catch (error) { throw new Error(`Cannot access SSH private key ${path}: ${(error as Error).message}`); }
+  if (!stat.isFile()) throw new Error(`SSH private key is not a regular file: ${path}`);
+  if (stat.size > MAX_PRIVATE_KEY_BYTES) throw new Error(`SSH private key exceeds the ${MAX_PRIVATE_KEY_BYTES}-byte limit: ${path}`);
+  try { return readFileSync(path); }
+  catch (error) { throw new Error(`Cannot read SSH private key ${path}: ${(error as Error).message}`); }
+}
+
+function parsePrivateKey(keyData: Buffer, passphrase?: string): any | Error {
+  let parsed: any;
+  try { parsed = ssh2Utils.parseKey(keyData, passphrase); }
+  catch (error) { return error as Error; }
+  if (parsed instanceof Error) return parsed;
+  const keys = Array.isArray(parsed) ? parsed : [parsed];
+  const privateKeys = keys.filter((key) => key?.isPrivateKey?.());
+  if (privateKeys.length !== 1) {
+    return new Error(privateKeys.length ? "SSH identity files containing multiple private keys are not supported" : "SSH identity file does not contain a private key");
+  }
+  return privateKeys[0];
+}
+
+function isPassphraseError(error: Error): boolean {
+  return /passphrase|encrypted private/i.test(error.message);
 }
 
 function parseForwardSpec(value: string): ForwardSpec {
@@ -557,15 +632,16 @@ function probeFingerprint(config: ParsedSsh): Promise<string> {
   });
 }
 
-function connect(config: ParsedSsh, password: string | undefined, fingerprint: string): Promise<Client> {
+type SshAuthentication = Partial<Pick<ConnectConfig, "password" | "privateKey" | "passphrase" | "agent">>;
+
+function connect(config: ParsedSsh, authentication: SshAuthentication, fingerprint: string): Promise<SshClient> {
   return new Promise((resolve, reject) => {
     const client = new Client();
     const options: ConnectConfig = {
       host: config.host,
       port: config.port,
       username: config.username,
-      ...(password ? { password } : {}),
-      ...(process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
+      ...authentication,
       readyTimeout: 12000,
       keepaliveInterval: 15000,
       keepaliveCountMax: 3,
@@ -579,7 +655,7 @@ function connect(config: ParsedSsh, password: string | undefined, fingerprint: s
 }
 
 function execRemote(
-  client: Client,
+  client: SshClient,
   command: string,
   allowFailure = false,
   timeoutSeconds = DEFAULT_REMOTE_TIMEOUT_SECONDS,
@@ -613,7 +689,7 @@ function execRemote(
 }
 
 function execRemoteLimited(
-  client: Client,
+  client: SshClient,
   command: string,
   timeoutSeconds: number,
   maxLines: number,
@@ -659,11 +735,11 @@ function execRemoteLimited(
   });
 }
 
-function getSftp(client: Client): Promise<SFTPWrapper> {
+function getSftp(client: SshClient): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => client.sftp((error, sftp) => error ? reject(error) : resolve(sftp)));
 }
 
-async function withSftp<T>(client: Client, operation: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
+async function withSftp<T>(client: SshClient, operation: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
   const sftp = await getSftp(client);
   try { return await operation(sftp); }
   finally { sftp.end(); }
@@ -674,10 +750,10 @@ function isReconnectable(error: unknown): boolean {
   return /channel open failure|open failed|not connected|no response|econnreset|econnrefused|etimedout|ehostunreach|epipe|connection (?:lost|closed)|socket.*closed|client is not connected/i.test(message);
 }
 
-class PasswordInput implements Component, Focusable {
+class SecretInput implements Component, Focusable {
   focused = false;
   private value = "";
-  constructor(private done: (value: string | null) => void, private renderNow: () => void) {}
+  constructor(private label: string, private done: (value: string | null) => void, private renderNow: () => void) {}
   handleInput(data: string): void {
     if (matchesKey(data, Key.enter)) return this.done(this.value);
     if (matchesKey(data, Key.escape)) return this.done(null);
@@ -690,15 +766,19 @@ class PasswordInput implements Component, Focusable {
     this.renderNow();
   }
   render(width: number): string[] {
-    return [truncateToWidth(`SSH password: ${"•".repeat([...this.value].length)}${this.focused ? CURSOR_MARKER : ""}\x1b[7m \x1b[27m`, width, "")];
+    return [truncateToWidth(`${this.label}: ${"•".repeat([...this.value].length)}${this.focused ? CURSOR_MARKER : ""}\x1b[7m \x1b[27m`, width, "")];
   }
   invalidate(): void {}
 }
 
-async function askPassword(ctx: any): Promise<string | null> {
-  if (ctx.mode !== "tui") return (await ctx.ui.input("SSH password:", "password")) ?? null;
+async function askSecret(ctx: any, label: string, placeholder: string): Promise<string | null> {
+  if (ctx.mode !== "tui") return (await ctx.ui.input(`${label}:`, placeholder)) ?? null;
   return ctx.ui.custom<string | null>((tui: any, _theme: any, _keys: any, done: (value: string | null) => void) =>
-    new PasswordInput(done, () => tui.requestRender()));
+    new SecretInput(label, done, () => tui.requestRender()));
+}
+
+async function askPassword(ctx: any): Promise<string | null> {
+  return askSecret(ctx, "SSH password", "password");
 }
 
 export default function sshRemoteExtension(pi: ExtensionAPI) {
@@ -720,6 +800,33 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   const configuredForwards = (command: string): string[] =>
     endpointConfig(loadRemoteConfig(), command).forwards ?? [];
+
+  const standardAuthentication = (password?: string): SshAuthentication => ({
+    ...(password ? { password } : {}),
+    ...(process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
+  });
+
+  const privateKeyAuthentication = async (parsed: ParsedSsh, ctx?: any): Promise<SshAuthentication> => {
+    const keyData = readPrivateKey(parsed);
+    let passphrase = getCachedKeyPassphrase(parsed);
+    let privateKey = parsePrivateKey(keyData, passphrase);
+    if (privateKey instanceof Error && isPassphraseError(privateKey)) {
+      if (passphrase) deleteCachedKeyPassphrase(parsed);
+      if (!ctx) throw new Error(`SSH private key ${resolveIdentityPath(parsed)} requires its passphrase again; reconnect interactively`);
+      passphrase = await askSecret(ctx, `Passphrase for ${parsed.identityFile}`, "private key passphrase") ?? undefined;
+      if (!passphrase) throw new Error("No SSH private key passphrase was provided");
+      privateKey = parsePrivateKey(keyData, passphrase);
+      if (privateKey instanceof Error) {
+        deleteCachedKeyPassphrase(parsed);
+        throw new Error(`Could not unlock SSH private key ${resolveIdentityPath(parsed)}: ${privateKey.message}`);
+      }
+      setCachedKeyPassphrase(parsed, passphrase);
+    }
+    if (privateKey instanceof Error) {
+      throw new Error(`Invalid SSH private key ${resolveIdentityPath(parsed)}: ${privateKey.message}`);
+    }
+    return { privateKey: keyData, ...(passphrase ? { passphrase } : {}) };
+  };
 
   const mapPath = (path: string): string => {
     if (!remote) return path;
@@ -841,11 +948,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     });
   };
 
-  const establish = async (parsed: ParsedSsh, password: string | undefined, cwd: string): Promise<RemoteState> => {
+  const establish = async (parsed: ParsedSsh, authentication: SshAuthentication, cwd: string): Promise<RemoteState> => {
     const key = `${parsed.host}:${parsed.port}`;
     const fingerprint = loadKnownHosts()[key];
     if (!fingerprint) throw new Error(`Host ${key} is not trusted; connect interactively with /remote first`);
-    const client = await connect(parsed, password, fingerprint);
+    const client = await connect(parsed, authentication, fingerprint);
     try {
       const cdCommand = cwd === FALLBACK_REMOTE_CWD ? "cd -- ~" : `cd -- ${quote(cwd)}`;
       const resolved = (await execRemote(client, `${cdCommand} && pwd -P`)).toString().trim();
@@ -866,8 +973,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     const parsed = parseSshCommand(source.command);
     const password = getCachedPassword(parsed);
     reconnectPromise = (async () => {
+      const authentication = parsed.identityFile
+        ? await privateKeyAuthentication(parsed)
+        : standardAuthentication(password);
       const oldClient = remote?.client;
-      const next = await establish(parsed, password, source.cwd);
+      const next = await establish(parsed, authentication, source.cwd);
       remote = next;
       routeRemoteTools = resumeRouting;
       credentialCache.resume = { command: parsed.command, cwd: next.cwd, routeRemoteTools, forwards: credentialCache.resume?.forwards };
@@ -881,7 +991,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return reconnectPromise;
   }
 
-  const withReconnect = async <T>(operation: (client: Client) => Promise<T>): Promise<T> => {
+  const withReconnect = async <T>(operation: (client: SshClient) => Promise<T>): Promise<T> => {
     if (!remote) throw new Error("SSH remote is not connected");
     try { return await operation(remote.client); }
     catch (error) {
@@ -947,24 +1057,28 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     let password = getCachedPassword(parsed);
     ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `SSH remote connecting ${endpointDisplayLabel(parsed)}…`));
     try {
+      let authentication = parsed.identityFile
+        ? await privateKeyAuthentication(parsed, ctx)
+        : standardAuthentication(password);
       let next: RemoteState;
       try {
-        next = await establish(parsed, password, cwd ?? configuredCwd(command));
+        next = await establish(parsed, authentication, cwd ?? configuredCwd(command));
       } catch (error) {
-        if (!/authentication methods failed|authentication failure/i.test((error as Error).message)) throw error;
+        if (parsed.identityFile || !/authentication methods failed|authentication failure/i.test((error as Error).message)) throw error;
         password = await askPassword(ctx) ?? undefined;
         if (!password) {
           lastConnectionError = "No SSH password was provided and SSH agent authentication failed";
           status(ctx);
           return null;
         }
-        next = await establish(parsed, password, cwd ?? configuredCwd(command));
+        authentication = standardAuthentication(password);
+        next = await establish(parsed, authentication, cwd ?? configuredCwd(command));
       }
       const previous = remote?.client;
       remote = next;
       routeRemoteTools = true;
       previous?.end();
-      if (password) setCachedPassword(parsed, password);
+      if (!parsed.identityFile && password) setCachedPassword(parsed, password);
       credentialCache.resume = { command, cwd: next.cwd, routeRemoteTools, forwards: [] };
       lastCommand = command;
       lastConnectionError = undefined;
@@ -974,7 +1088,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       ctx.ui.notify(`SSH remote connected: ${endpointDisplayLabel(next)}:${next.cwd}`, "info");
       return next;
     } catch (error) {
-      deleteCachedPassword(parsed);
+      if (!parsed.identityFile) deleteCachedPassword(parsed);
       remote = null;
       lastConnectionError = (error as Error).message;
       status(ctx);
@@ -987,7 +1101,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (remote) return remote;
     if (credentialCache.resume) return reconnectRemote();
     const command = lastCommand || activeSshCommand();
-    if (!command) throw new Error("No SSH endpoint configured; use /remote ssh USER@HOST -p PORT");
+    if (!command) throw new Error("No SSH endpoint configured; use /remote ssh USER@HOST -p PORT [-i KEY]");
     const state = await connectInteractive(command, ctx, configuredCwd(command));
     if (!state) throw new Error("SSH remote connection was cancelled or failed");
     return state;
@@ -1040,26 +1154,28 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     status(ctx);
   };
 
-  const disconnect = (ctx: any, forgetPassword = false) => {
+  const disconnect = (ctx: any, forgetCredentials = false) => {
     const previous = remote;
     remote = null;
     routeRemoteTools = false;
     reconnectPromise = null;
     credentialCache.resume = undefined;
     void stopForwards();
-    if (forgetPassword) {
-      if (previous) deleteCachedPassword(previous);
-      else {
-        const configured = activeSshCommand();
-        if (configured) {
-          try { deleteCachedPassword(parseSshCommand(configured)); } catch {}
-        }
+    if (forgetCredentials) {
+      const configured = previous ?? (() => {
+        const command = activeSshCommand();
+        if (!command) return undefined;
+        try { return parseSshCommand(command); } catch { return undefined; }
+      })();
+      if (configured) {
+        deleteCachedPassword(configured);
+        deleteCachedKeyPassphrase(configured);
       }
     }
     previous?.client.end();
     status(ctx);
     persistSessionRemoteState();
-    ctx.ui.notify(forgetPassword ? "SSH remote disconnected and cached password cleared" : "SSH remote mode disabled (password remains cached in memory only)", "info");
+    ctx.ui.notify(forgetCredentials ? "SSH remote disconnected and cached credentials cleared" : "SSH remote mode disabled (credentials remain cached in memory only)", "info");
   };
 
   const detectRemoteMimeType = async (path: string): Promise<string | undefined> => {
@@ -1178,7 +1294,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "remote",
     label: "Remote",
-    description: "Connect, reconnect, annotate endpoints, manage server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords are never accepted as arguments and are cached only in process memory.",
+    description: "Connect, reconnect, annotate endpoints, manage server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Connections support SSH agent, password, or an explicit local private key with -i. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords and key passphrases are never accepted as arguments and are cached only in process memory.",
     promptSnippet: "Control the configured remote SSH connection, endpoint note and memory, working directory, and local port forwarding",
     promptGuidelines: [
       "Use remote when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
@@ -1189,7 +1305,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "memory"] as const),
-      command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22; optionally selects the endpoint for note or memory" })),
+      command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22 or ssh -i ~/.ssh/id_ed25519 root@host; optionally selects the endpoint for note or memory" })),
       note: Type.Optional(Type.String({ description: "Endpoint note for the note action; omit or use an empty string to clear it" })),
       memory: Type.Optional(Type.String({ description: "Persistent context shared by the endpoint's user@host across SSH ports; omit or use an empty string to clear it" })),
       cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
@@ -1206,7 +1322,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       }
       if (params.action === "disconnect" || params.action === "forget") {
         disconnect(ctx, params.action === "forget");
-        return { content: [{ type: "text", text: params.action === "forget" ? "Disconnected and forgot the cached password." : "Disconnected from SSH remote and returned to local tools." }], details: { connected: false } };
+        return { content: [{ type: "text", text: params.action === "forget" ? "Disconnected and forgot the cached credentials." : "Disconnected from SSH remote and returned to local tools." }], details: { connected: false } };
       }
       if (params.action === "reconnect") {
         if (!remote && !credentialCache.resume) throw new Error("No SSH remote connection is available to reconnect");
@@ -1302,7 +1418,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("remote", {
-    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] | config | use USER@HOST:PORT | config note TEXT|--clear | config memory TEXT|--clear | config cwd PATH | config display-lines N | config read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
+    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] [-i KEY] | config | use USER@HOST:PORT | config note TEXT|--clear | config memory TEXT|--clear | config cwd PATH | config display-lines N | config read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
     handler: async (args, ctx) => {
       const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
       const action = input.toLowerCase();

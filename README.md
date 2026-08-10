@@ -82,6 +82,16 @@ Return to local tools with:
 /remote off
 ```
 
+### Private key authentication
+
+Pass an explicit local private key with `-i`:
+
+```text
+/remote ssh -i ~/.ssh/id_ed25519 root@gpu-box.example.com -p 2202
+```
+
+Identity paths must be absolute or start with `~/`. Unencrypted and passphrase-protected private keys are supported. Pi prompts for an encrypted key's passphrase and caches it only in the current process for reconnects; `/remote forget` clears it. When `-i` is present, that key is used exclusively instead of silently falling back to SSH agent or password authentication. Commands without `-i` keep the existing SSH agent and password flow unchanged.
+
 ## Examples
 
 ### 1. Let the agent investigate and repair a remote failure
@@ -160,7 +170,7 @@ These requests are handled through the agent-facing `remote` tool; slash command
 
 | Command | Purpose |
 |---|---|
-| `/remote ssh USER@HOST -p PORT` | Save, select, and connect to an endpoint |
+| `/remote ssh USER@HOST -p PORT [-i KEY]` | Save, select, and connect using agent/password or an explicit private key |
 | `/remote` | Connect to the selected endpoint or prompt for one |
 | `/remote config` | List saved endpoints and settings |
 | `/remote use USER@HOST:PORT` | Select a saved endpoint |
@@ -185,7 +195,7 @@ These requests are handled through the agent-facing `remote` tool; slash command
 | `/remote status` | Show the active workspace |
 | `/remote reload` | Reconnect the active workspace |
 | `/remote off` | Disconnect and return tools to local execution |
-| `/remote forget` | Disconnect and clear the in-memory password |
+| `/remote forget` | Disconnect and clear cached passwords and key passphrases |
 
 ## Persistence, output, and security
 
@@ -195,23 +205,23 @@ Endpoint configuration is stored locally in:
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-Saved global values include endpoints, active endpoint, notes, `user@host`-specific server memories, remote working directories, forwards, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Server memory is user-configured trusted context and is inserted into each model request only while a matching endpoint is the active remote workspace; it is not read from the remote server. Passwords are **never written to this file**: SSH agent authentication is preferred, and prompted passwords remain only in process memory.
+Saved global values include endpoints, active endpoint, notes, `user@host`-specific server memories, remote working directories, forwards, identity file paths, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Server memory is user-configured trusted context and is inserted into each model request only while a matching endpoint is the active remote workspace; it is not read from the remote server. Private key contents, passwords, and key passphrases are **never written to this file**. Private keys are read locally only when connecting; prompted passwords and passphrases remain only in process memory.
 
 New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
 
 ## Current SSH scope
 
-The extension currently supports direct SSH commands with `-p` and `-l`. It does not yet consume `~/.ssh/config`, `IdentityFile`, or ProxyJump settings.
+The extension currently supports direct SSH commands with `-p`, `-l`, and `-i`. It does not yet consume `~/.ssh/config` or ProxyJump settings; use `-i` explicitly instead of relying on an `IdentityFile` entry.
 
 ## Releases
 
-Latest release: [v0.1.7](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.7)
+Latest release: [v0.1.8](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.8)
 
 | Version | Date | Highlights |
 |---|---|---|
+| [0.1.8](CHANGELOG.md#018---2026-08-10) | 2026-08-10 | Explicit private-key login, cross-port server memory, and the shorter `remote` tool name |
 | [0.1.7](CHANGELOG.md#017---2026-08-05) | 2026-08-05 | Session-aware SSH workspace restoration for new, forked, and resumed sessions |
 | [0.1.6](CHANGELOG.md#016---2026-08-05) | 2026-08-05 | Bounded remote reads, streamed command output, and per-turn output budgets |
-| [0.1.5](CHANGELOG.md#015---2026-08-04) | 2026-08-04 | Endpoint-specific server memory and automatic context injection |
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release history, including additions, behavior changes, and bug fixes.
 

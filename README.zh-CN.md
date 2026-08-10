@@ -124,6 +124,16 @@ pi install npm:pi-ssh-remote
 /remote off
 ```
 
+### 使用私钥文件登录
+
+通过 `-i` 指定本地私钥：
+
+```text
+/remote ssh -i ~/.ssh/id_ed25519 root@gpu-box.example.com -p 2202
+```
+
+密钥路径必须是绝对路径或以 `~/` 开头。插件支持未加密私钥和带 passphrase 的私钥；对于加密私钥，Pi 会以遮罩方式询问 passphrase，并仅在当前进程内缓存以便自动重连，`/remote forget` 会清除它。指定 `-i` 后只使用该私钥，不会静默回退到 SSH Agent 或密码；不带 `-i` 的旧命令仍保持原有的 SSH Agent 和密码登录流程。
+
 ## 常见用法
 
 ### 1. 让 Pi 直接排查远程服务故障
@@ -214,7 +224,7 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。
 
 | 命令 | 作用 |
 |---|---|
-| `/remote ssh USER@HOST -p PORT` | 保存并连接服务器 |
+| `/remote ssh USER@HOST -p PORT [-i KEY]` | 保存并使用 Agent／密码或指定私钥连接服务器 |
 | `/remote` | 连接当前选中的服务器，或提示输入 SSH 地址 |
 | `/remote config` | 查看已保存的服务器和配置 |
 | `/remote use USER@HOST:PORT` | 切换到指定服务器 |
@@ -239,7 +249,7 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。
 | `/remote status` | 查看当前连接和工作目录 |
 | `/remote reload` | 重新连接当前服务器 |
 | `/remote off` | 断开连接并返回本地 |
-| `/remote forget` | 断开连接并清除内存中的密码 |
+| `/remote forget` | 断开连接并清除内存中的密码和密钥 passphrase |
 
 ## 配置保存在哪里
 
@@ -257,12 +267,13 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。
 - 服务器特定记忆；
 - 默认远程目录；
 - 端口转发配置；
+- 私钥文件路径；
 - 命令预览设置；
 - 模型输出预算。
 
 此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。服务器记忆按 `user@host` 识别，不受 SSH 端口影响。它是由用户在本地配置的可信上下文，不会从远程服务器自动读取；仅当匹配的 endpoint 作为远端工作区启用时才会加入每次模型请求。
 
-密码不会写入配置文件。插件会优先使用 SSH agent；如果需要手动输入密码，密码只会缓存在当前 Pi 进程的内存中。
+私钥内容、密码和密钥 passphrase 都不会写入配置文件。插件仅在连接时从本地读取私钥；手动输入的密码和 passphrase 只会缓存在当前 Pi 进程的内存中。
 
 ## 安全与输出限制
 
@@ -279,17 +290,17 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。
 
 ## 当前限制
 
-目前只支持 SSH 直连，以及 `-p`、`-l` 参数。暂不读取 `~/.ssh/config`，也不支持 `IdentityFile` 和 ProxyJump。
+目前只支持 SSH 直连，以及 `-p`、`-l`、`-i` 参数。暂不读取 `~/.ssh/config` 或 ProxyJump；如需指定私钥，请显式使用 `-i`，不要依赖 SSH config 中的 `IdentityFile`。
 
 ## 版本发布
 
-最新版本：[v0.1.7](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.7)
+最新版本：[v0.1.8](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.8)
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
+| [0.1.8](CHANGELOG.md#018---2026-08-10) | 2026-08-10 | 显式私钥登录、跨端口服务器记忆与更短的 `remote` 工具名 |
 | [0.1.7](CHANGELOG.md#017---2026-08-05) | 2026-08-05 | 新建、分叉和恢复 session 时自动恢复对应 SSH 工作区 |
 | [0.1.6](CHANGELOG.md#016---2026-08-05) | 2026-08-05 | 有界远端读取、流式命令输出与每轮输出预算 |
-| [0.1.5](CHANGELOG.md#015---2026-08-04) | 2026-08-04 | endpoint 级服务器记忆与自动上下文注入 |
 
 完整的新增内容、行为变更和 Bug 修复记录请查看 [CHANGELOG.md](CHANGELOG.md)。
 
