@@ -12,11 +12,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Changed
 
-- Removed the redundant `SSH remote` prefix from footer status labels.
+- None.
 
 ### Fixed
 
 - None.
+
+## [0.1.9] - 2026-08-12
+
+### Added
+
+- None.
+
+### Changed
+
+- Removed the redundant `SSH remote` prefix from footer status labels.
+
+### Fixed
+
+- Kept injected server memory as a single stable context prefix so tool continuations do not repeatedly move it to the end of the conversation or invalidate cached provider context.
 
 ## [0.1.8] - 2026-08-10
 
@@ -161,7 +175,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.5...v0.1.6

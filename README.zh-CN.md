@@ -294,13 +294,13 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。
 
 ## 版本发布
 
-最新版本：[v0.1.8](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.8)
+最新版本：[v0.1.9](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.9)
 
 | 版本 | 日期 | 主要内容 |
 |---|---|---|
+| [0.1.9](CHANGELOG.md#019---2026-08-12) | 2026-08-12 | 稳定且去重的服务器记忆上下文与更短的状态栏标签 |
 | [0.1.8](CHANGELOG.md#018---2026-08-10) | 2026-08-10 | 显式私钥登录、跨端口服务器记忆与更短的 `remote` 工具名 |
 | [0.1.7](CHANGELOG.md#017---2026-08-05) | 2026-08-05 | 新建、分叉和恢复 session 时自动恢复对应 SSH 工作区 |
-| [0.1.6](CHANGELOG.md#016---2026-08-05) | 2026-08-05 | 有界远端读取、流式命令输出与每轮输出预算 |
 
 完整的新增内容、行为变更和 Bug 修复记录请查看 [CHANGELOG.md](CHANGELOG.md)。
 

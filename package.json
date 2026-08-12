@@ -1,6 +1,6 @@
 {
   "name": "pi-ssh-remote",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Persistent remote SSH workspaces for Pi.",
   "type": "module",
   "author": "Yutong Bian",

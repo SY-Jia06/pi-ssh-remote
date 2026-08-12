@@ -1679,14 +1679,17 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (!remote || !routeRemoteTools) return undefined;
     const content = serverMemoryContext(remote);
     if (!content) return undefined;
+    const messages = event.messages.filter((message) =>
+      message.role !== "custom" || message.customType !== "ssh-remote-server-memory"
+    );
     return {
-      messages: [...event.messages, {
+      messages: [{
         role: "custom",
         customType: "ssh-remote-server-memory",
         content,
         display: false,
         timestamp: Date.now(),
-      }],
+      }, ...messages],
     };
   });
 }
