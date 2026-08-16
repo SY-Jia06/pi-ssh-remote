@@ -54,7 +54,7 @@ H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 - 服务器特定记忆；
 - 端口转发配置。
 
-例如可以把几台机器分别备注为 `8xH100 训练机`、`预发布环境`、`线上只读机`。服务器记忆按 `user@host` 保存为 JSON 文件，每条记忆都是稳定的 `{ "id", "content" }` 对象；同一用户和主机即使通过不同 SSH 端口连接，也会使用同一组条目。插件会把精确的本地文件路径告诉 Pi，因此即使其他工具已路由到远端，Pi 仍能用普通 `read`、`edit`、`write` 工具对记忆条目增删查改。连接匹配的 endpoint 并启用远端工具路由后，有效条目会自动注入模型上下文；断开连接或切换到纯隧道模式后，后续请求不再注入。所有配置保存在本地，重启 Pi 后仍然存在。
+例如可以把几台机器分别备注为 `8xH100 训练机`、`预发布环境`、`线上只读机`。这些配置保存在本地，重启 Pi 后仍然存在。
 
 ### 断线后可以自动恢复
 
@@ -109,12 +109,6 @@ pi install npm:pi-ssh-remote
 /remote config note H100 训练机
 ```
 
-然后直接告诉 Pi：
-
-```text
-添加一条服务器记忆：使用 /opt/conda/bin/python，不要停止其他用户的共享任务。
-```
-
 查看当前状态：
 
 ```text
@@ -128,6 +122,29 @@ pi install npm:pi-ssh-remote
 ```text
 /remote off
 ```
+
+### 服务器记忆
+
+直接告诉 Pi 要为当前服务器记住什么：
+
+```text
+记住这台服务器使用 /opt/conda/bin/python，不要停止共享任务。
+```
+
+查看已有记忆和 ID：
+
+```text
+/remote memory
+```
+
+通过 ID 修改或删除：
+
+```text
+把记忆 deploy-command 改为使用 /opt/deploy/v2/run.sh。
+删除记忆 obsolete-proxy-rule。
+```
+
+以后连接这台服务器时，Pi 会自动使用这些记忆。只有明确要求删除时才会删除。
 
 ### 使用私钥文件登录
 
@@ -188,7 +205,7 @@ pi install npm:pi-ssh-remote
 /remote
 ```
 
-备注和默认目录会按 `user@host:port` 分别保存，不会互相覆盖；服务器记忆则按 `user@host` 保存为独立 JSON 文件并跨端口共享。
+备注和默认目录会按 `user@host:port` 分别保存，不会互相覆盖。
 
 ### 4. 远端启动模型，本地开发界面
 
@@ -223,25 +240,6 @@ pi install npm:pi-ssh-remote
 把远端 8000 端口转发到本地 8000，但代码工具继续留在本地。
 ```
 
-```text
-添加一条服务器记忆：部署必须使用 /opt/deploy/run.sh。
-```
-
-更新或删除前，可以先展示当前服务器的全部记忆和 ID：
-
-```text
-/remote memory
-```
-
-然后使用展示出的 ID：
-
-```text
-把 ID 为 deploy-command 的记忆更新为使用 /opt/deploy/v2/run.sh。
-删除 ID 为 obsolete-proxy-rule 的服务器记忆。
-```
-
-Pi 会通过插件提供的 `remote` 工具完成这些操作。`memory` action 只负责定位和查看匹配的 JSON 文件，实际增删查改使用 Pi 自带的 `read`、`edit`、`write`。删除规则会明确注入给 Agent：只有用户明确要求“删除／移除／忘记”服务器记忆时，Pi 才能先读取文件、确认准确条目 ID，再只删除该对象；目标不明确时必须询问，修改请求不等于删除授权，删除全部条目也必须由用户明确提出。
-
 ## 命令说明
 
 | 命令 | 作用 |
@@ -252,7 +250,7 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。`memory` action 
 | `/remote use USER@HOST:PORT` | 切换到指定服务器 |
 | `/remote config note TEXT` | 给当前服务器添加或修改备注 |
 | `/remote config note --clear` | 清除当前服务器备注 |
-| `/remote memory` | 展示当前服务器的全部记忆条目、ID 和 JSON 文件路径 |
+| `/remote memory` | 展示当前服务器的记忆条目和 ID |
 | `/remote config cwd PATH` | 设置默认远程工作目录 |
 | `/remote cd PATH` | 切换当前远程目录并保存 |
 | `/remote config forward MAPPING...` | 保存端口转发配置，例如 `7860:127.0.0.1:7860` |
@@ -291,15 +289,9 @@ Pi 会通过插件提供的 `remote` 工具完成这些操作。`memory` action 
 - 命令预览设置；
 - 模型输出预算。
 
-服务器记忆单独保存在：
+此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。
 
-```text
-~/.pi/agent/ssh-remote-memories/
-```
-
-文件结构为 `{ "server", "entries": [{ "id", "content" }] }`，旧版字符串记忆会自动迁移为 JSON 条目。此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。服务器记忆按 `user@host` 识别，不受 SSH 端口影响。它是由用户在本地配置的可信上下文，不会从远程服务器自动读取；仅当匹配的 endpoint 作为远端工作区启用时才会加入每次模型请求。远端路由启用时，只有当前服务器对应的精确记忆文件路径会被 `read`、`edit`、`write` 特殊处理为本地文件。
-
-私钥内容、密码和密钥 passphrase 都不会写入这些配置文件。插件仅在连接时从本地读取私钥；手动输入的密码和 passphrase 只会缓存在当前 Pi 进程的内存中。
+私钥内容、密码和密钥 passphrase 都不会写入配置文件。插件仅在连接时从本地读取私钥；手动输入的密码和 passphrase 只会缓存在当前 Pi 进程的内存中。
 
 ## 安全与输出限制
 

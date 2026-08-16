@@ -12,7 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Changed
 
-- None.
+- Simplified the server-memory documentation to focus on adding, listing, updating, and deleting entries without exposing implementation details.
 
 ### Fixed
 
