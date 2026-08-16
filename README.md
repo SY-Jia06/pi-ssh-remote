@@ -31,7 +31,7 @@ The extension exposes `remote` for the agent and `/remote` for the user. You can
 
 ### Stateful endpoints instead of disposable SSH commands
 
-Each `user@host:port` endpoint remembers its remote working directory, note, and port-forward configuration locally. Server memory is shared by `user@host`, so connecting as the same user to the same host through another port uses the same memory. Notes such as `H100 training`, `staging`, or `customer demo` appear in configuration, status messages, and Pi's footer, so the active execution environment stays visible. Server memory is automatically injected into the model context whenever a matching endpoint is connected as the active remote workspace.
+Each `user@host:port` endpoint remembers its remote working directory, note, and port-forward configuration locally. Server memory is a per-`user@host` JSON file containing stable `{ "id", "content" }` entries, so another SSH port for the same user and host uses the same entries. Pi is told the exact local file path and can use its normal `read`, `edit`, and `write` tools for entry-level CRUD even while other tools are routed remotely. Notes such as `H100 training`, `staging`, or `customer demo` appear in configuration, status messages, and Pi's footer, so the active execution environment stays visible. Valid server-memory entries are automatically injected into the model context whenever a matching endpoint is connected as the active remote workspace.
 
 ### Resilient and bounded by default
 
@@ -66,8 +66,9 @@ Requires Node.js 20+. The remote server must provide Bash, SFTP, and GNU `timeou
 /remote ssh root@gpu-box.example.com -p 2202
 /remote cd /srv/project
 /remote config note H100 training server
-/remote config memory Use /opt/conda/bin/python and never stop shared jobs.
 /remote status
+
+You: Add a server-memory entry saying to use /opt/conda/bin/python and never stop shared jobs.
 ```
 
 From this point, normal Pi operations target `/srv/project` on the remote server. The footer makes that routing explicit:
@@ -131,7 +132,7 @@ The default foreground timeout prevents an accidental long-running command from 
 /remote
 ```
 
-Endpoint notes and working directories, plus `user@host`-specific server memories, survive Pi restarts because they are stored in the local remote configuration. When Pi connects to an endpoint, the memory matching its user and host is added to the system context on every agent run while remote tool routing remains active; the SSH port does not affect memory selection. Disconnecting or switching to tunnel-only mode removes it from subsequent model requests.
+Endpoint notes and working directories survive Pi restarts in the local remote configuration. `user@host`-specific memory survives in a separate local JSON file under `~/.pi/agent/ssh-remote-memories/`; each entry has a stable `id` and `content`. When Pi connects to an endpoint, valid entries matching its user and host are added to the model context on every agent run while remote tool routing remains active; the SSH port does not affect memory selection. Disconnecting or switching to tunnel-only mode removes them from subsequent model requests.
 
 ### 4. Expose a remote service while editing locally
 
@@ -164,7 +165,24 @@ Forward the remote service on port 8000 to localhost:8000, but keep my coding
 tools on the local repository.
 ```
 
-These requests are handled through the agent-facing `remote` tool; slash commands are optional. For safety, calling its `memory` action without a `memory` argument only reads the current server memory. Non-empty text is appended to the existing memory instead of replacing it; retrying the same final entry is a no-op. Clearing still requires the explicit `--clear` value.
+```text
+Add a server-memory entry that says deployments must use /opt/deploy/run.sh.
+```
+
+List the current server's entries and IDs before referring to one:
+
+```text
+/remote memory
+```
+
+Then update or delete by the displayed ID:
+
+```text
+Update the entry with ID deploy-command to use /opt/deploy/v2/run.sh.
+Delete the server-memory entry with ID obsolete-proxy-rule.
+```
+
+These requests are handled through the agent-facing `remote` tool; slash commands are optional. The `memory` action locates and inspects the matching JSON file, while Pi's normal `read`, `edit`, and `write` tools perform entry-level add, query, update, and delete operations. The injected instructions make deletion deliberately strict: Pi must first read the file, identify the exact entry ID, and delete only that object—and only after the user explicitly asks to delete, remove, or forget memory. Ambiguous targets require clarification, update requests do not imply deletion, and deleting all entries requires an explicit request to delete all server memory.
 
 ## Command reference
 
@@ -176,8 +194,7 @@ These requests are handled through the agent-facing `remote` tool; slash command
 | `/remote use USER@HOST:PORT` | Select a saved endpoint |
 | `/remote config note TEXT` | Persist a note for the selected endpoint |
 | `/remote config note --clear` | Clear its note |
-| `/remote config memory TEXT` | Persist context for the current `user@host`, shared across ports |
-| `/remote config memory --clear` | Clear the current `user@host` memory |
+| `/remote memory` | List the current server's memory entries, IDs, and JSON file path |
 | `/remote config cwd PATH` | Persist its default remote working directory |
 | `/remote cd PATH` | Change the connected remote cwd and persist it |
 | `/remote config forward MAPPING...` | Persist port forwards such as `7860:127.0.0.1:7860` |
@@ -205,7 +222,7 @@ Endpoint configuration is stored locally in:
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-Saved global values include endpoints, active endpoint, notes, `user@host`-specific server memories, remote working directories, forwards, identity file paths, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Server memory is user-configured trusted context and is inserted into each model request only while a matching endpoint is the active remote workspace; it is not read from the remote server. Private key contents, passwords, and key passphrases are **never written to this file**. Private keys are read locally only when connecting; prompted passwords and passphrases remain only in process memory.
+Saved global values include endpoints, active endpoint, notes, remote working directories, forwards, identity file paths, preview settings, and model-output budgets. Server-memory entries are stored separately under `~/.pi/agent/ssh-remote-memories/` as `{ "server", "entries": [{ "id", "content" }] }`; legacy string memories are migrated automatically. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Server memory is user-configured trusted context and is inserted into each model request only while a matching endpoint is the active remote workspace; it is not read from the remote server. The current server's exact memory path is the only local path that the routed `read`, `edit`, and `write` tools special-case. Private key contents, passwords, and key passphrases are **never written to these files**. Private keys are read locally only when connecting; prompted passwords and passphrases remain only in process memory.
 
 New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
 
@@ -215,13 +232,13 @@ The extension currently supports direct SSH commands with `-p`, `-l`, and `-i`. 
 
 ## Releases
 
-Latest release: [v0.1.10](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.10)
+Latest release: [v0.1.11](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.11)
 
 | Version | Date | Highlights |
 |---|---|---|
+| [0.1.11](CHANGELOG.md#0111---2026-08-16) | 2026-08-16 | JSON memory entries, prompt-guided CRUD, and `/remote memory` listing |
 | [0.1.10](CHANGELOG.md#0110---2026-08-16) | 2026-08-16 | Safe inspect-by-default and append-only agent updates for server memory |
 | [0.1.9](CHANGELOG.md#019---2026-08-12) | 2026-08-12 | Stable deduplicated server-memory context and shorter footer labels |
-| [0.1.8](CHANGELOG.md#018---2026-08-10) | 2026-08-10 | Explicit private-key login, cross-port server memory, and the shorter `remote` tool name |
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release history, including additions, behavior changes, and bug fixes.
 

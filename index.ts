@@ -7,8 +7,8 @@
  */
 
 import ssh2, { type Client as SshClient, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
-import { dirname, isAbsolute, join, posix, relative, sep } from "node:path";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { Type } from "typebox";
@@ -64,9 +64,20 @@ interface RemoteEndpointConfig {
   memory?: string;
 }
 
+interface ServerMemoryEntry {
+  id: string;
+  content: string;
+}
+
+interface ServerMemoryFile {
+  server: string;
+  entries: ServerMemoryEntry[];
+}
+
 interface RemoteConfig {
   activeEndpoint?: string;
   endpoints?: Record<string, RemoteEndpointConfig>;
+  /** Legacy values migrated into per-server JSON files at extension startup. */
   serverMemories?: Record<string, string>;
   displayLines?: number;
   readMaxLines?: number;
@@ -98,6 +109,7 @@ interface SessionRemoteState {
 const AGENT_DIR = join(process.env.HOME || ".", CONFIG_DIR_NAME, "agent");
 const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
 const REMOTE_CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
+const SERVER_MEMORY_DIR = join(AGENT_DIR, "ssh-remote-memories");
 const FALLBACK_REMOTE_CWD = "~";
 const DEFAULT_DISPLAY_LINES = 5;
 const MAX_DISPLAY_LINES = 50;
@@ -412,21 +424,103 @@ function endpointDisplayLabel(endpoint: ParsedSsh, config = loadRemoteConfig()):
   return note ? `${note} (${endpoint.label})` : endpoint.label;
 }
 
-function endpointMemory(endpoint: ParsedSsh, config = loadRemoteConfig()): string | undefined {
-  return config.serverMemories?.[serverMemoryId(endpoint)]?.trim() || undefined;
+function serverMemoryFilePath(endpoint: ParsedSsh | string): string {
+  const server = typeof endpoint === "string" ? endpoint : serverMemoryId(endpoint);
+  return join(SERVER_MEMORY_DIR, `${Buffer.from(server, "utf8").toString("base64url")}.json`);
+}
+
+function legacyMemoryEntries(memory: string): ServerMemoryEntry[] {
+  return memory
+    .trim()
+    .split(/\n\s*\n/)
+    .map((content) => content.trim())
+    .filter(Boolean)
+    .map((content, index) => ({ id: `legacy-${String(index + 1).padStart(3, "0")}`, content }));
+}
+
+function writeServerMemoryFile(path: string, memory: ServerMemoryFile): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(memory, null, 2) + "\n", { mode: 0o600 });
+}
+
+function migrateLegacyServerMemories(): void {
+  const config = loadRemoteConfig();
+  const legacy = config.serverMemories ?? {};
+  if (!Object.keys(legacy).length) {
+    mkdirSync(SERVER_MEMORY_DIR, { recursive: true });
+    return;
+  }
+
+  const remaining = { ...legacy };
+  let changed = false;
+  for (const [server, content] of Object.entries(legacy)) {
+    const path = serverMemoryFilePath(server);
+    try {
+      if (!existsSync(path)) {
+        writeServerMemoryFile(path, { server, entries: legacyMemoryEntries(content) });
+      }
+      delete remaining[server];
+      changed = true;
+    } catch {}
+  }
+  if (changed) saveRemoteConfig({ ...config, serverMemories: remaining });
+}
+
+function ensureServerMemoryFile(endpoint: ParsedSsh): string {
+  const path = serverMemoryFilePath(endpoint);
+  if (!existsSync(path)) writeServerMemoryFile(path, { server: serverMemoryId(endpoint), entries: [] });
+  return path;
+}
+
+function loadServerMemory(endpoint: ParsedSsh): ServerMemoryFile | undefined {
+  const path = serverMemoryFilePath(endpoint);
+  if (!existsSync(path)) return undefined;
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<ServerMemoryFile>;
+  if (parsed.server !== serverMemoryId(endpoint) || !Array.isArray(parsed.entries)) {
+    throw new Error("expected an object with the matching server and an entries array");
+  }
+  const ids = new Set<string>();
+  const entries = parsed.entries.map((entry, index) => {
+    if (!entry || typeof entry.id !== "string" || !entry.id.trim() || typeof entry.content !== "string" || !entry.content.trim()) {
+      throw new Error(`entry ${index + 1} must contain non-empty string id and content fields`);
+    }
+    const id = entry.id.trim();
+    if (ids.has(id)) throw new Error(`duplicate entry id: ${id}`);
+    ids.add(id);
+    return { id, content: entry.content.trim() };
+  });
+  return { server: parsed.server, entries };
+}
+
+function formatServerMemoryEntries(memory: ServerMemoryFile | undefined): string {
+  if (!memory?.entries.length) return "No entries.";
+  return memory.entries.map((entry) => `[${entry.id}]\n${entry.content}`).join("\n\n");
+}
+
+function memoryManagementPrompt(remote: RemoteState): string {
+  let path = serverMemoryFilePath(remote);
+  try { path = ensureServerMemoryFile(remote); }
+  catch {}
+  return `Persistent memory for this SSH server is a local JSON file at ${path}. This exact path is always handled by Pi's local read, write, and edit tools even while other tools are routed over SSH. The file schema is {"server":"${serverMemoryId(remote)}","entries":[{"id":"stable-unique-id","content":"memory text"}]}. If the file does not exist, create it with that server value and an empty entries array. Read the file before changing it and preserve valid JSON plus all unrelated entries. Add by appending one object with a unique stable id; query by reading the file; update by editing only the matching id. DELETE SAFETY: delete an entry only when the user explicitly asks to delete, remove, or forget server memory. Before deleting, read the file and identify the exact id; if the target is ambiguous, ask the user. Use edit to remove only that exact object and preserve every other entry. Never treat a correction or replacement request as permission to delete, and never delete all entries unless the user explicitly requests deletion of all server memory.`;
 }
 
 function remoteSystemPrompt(systemPrompt: string, localCwd: string, remote: RemoteState): string {
-  return systemPrompt.replace(
+  const workspacePrompt = systemPrompt.replace(
     `Current working directory: ${localCwd}`,
-    `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All read, write, edit, bash, and user shell operations run on this remote server. Use remote with action disconnect to return to the local environment when requested.`,
+    `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All read, write, edit, bash, and user shell operations run on this remote server, except for the explicitly identified local server-memory JSON file. Use remote with action disconnect to return to the local environment when requested.`,
   );
+  return `${workspacePrompt}\n\n${memoryManagementPrompt(remote)}`;
 }
 
 function serverMemoryContext(remote: RemoteState): string | undefined {
-  const memory = endpointMemory(remote);
-  if (!memory) return undefined;
-  return `<ssh_remote_server_memory endpoint="${remote.label}">\nThe following is user-configured, persistent memory specific to this SSH server. Apply it while working on this server:\n${memory}\n</ssh_remote_server_memory>`;
+  const path = serverMemoryFilePath(remote);
+  let memory: ServerMemoryFile | undefined;
+  try { memory = loadServerMemory(remote); }
+  catch (error) {
+    return `<ssh_remote_server_memory endpoint="${remote.label}" path="${path}">\nThe server-memory JSON file is invalid and must not be applied until repaired: ${(error as Error).message}\n</ssh_remote_server_memory>`;
+  }
+  if (!memory?.entries.length) return undefined;
+  return `<ssh_remote_server_memory endpoint="${remote.label}" path="${path}">\nThe following user-configured JSON entries are persistent memory specific to this SSH server. Apply their content while working on this server:\n${JSON.stringify(memory.entries, null, 2)}\n</ssh_remote_server_memory>`;
 }
 
 function saveEndpointConfig(command: string, updates: RemoteEndpointConfig, makeActive = false): void {
@@ -442,23 +536,6 @@ function saveEndpointConfig(command: string, updates: RemoteEndpointConfig, make
   });
 }
 
-function saveServerMemory(command: string, memory: string | undefined): void {
-  const config = loadRemoteConfig();
-  const parsed = parseSshCommand(command);
-  const endpointKey = cacheId(parsed);
-  const memoryKey = serverMemoryId(parsed);
-  const serverMemories = { ...(config.serverMemories ?? {}) };
-  if (memory) serverMemories[memoryKey] = memory;
-  else delete serverMemories[memoryKey];
-  saveRemoteConfig({
-    ...config,
-    serverMemories,
-    endpoints: {
-      ...(config.endpoints ?? {}),
-      [endpointKey]: { ...endpointConfig(config, command), sshCommand: command },
-    },
-  });
-}
 
 function loadKnownHosts(): Record<string, string> {
   try { return JSON.parse(readFileSync(KNOWN_HOSTS_FILE, "utf8")); }
@@ -782,6 +859,8 @@ async function askPassword(ctx: any): Promise<string | null> {
 }
 
 export default function sshRemoteExtension(pi: ExtensionAPI) {
+  migrateLegacyServerMemories();
+
   const localCwd = process.cwd();
   let remote: RemoteState | null = null;
   let routeRemoteTools = false;
@@ -1270,16 +1349,20 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const localWrite = createWriteTool(localCwd);
   const localEdit = createEditTool(localCwd);
   const localBash = createBashTool(localCwd);
+  const targetsLocalServerMemory = (path: unknown): boolean => {
+    if (!remote || typeof path !== "string") return false;
+    return resolve(path.replace(/^@/, "")) === serverMemoryFilePath(remote);
+  };
   pi.registerTool({
     ...localRead,
     description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue.`,
     promptGuidelines: ["Use read with offset/limit for remote code and logs; inspect large files in focused chunks instead of reading them wholesale."],
-    execute: (id, params, signal, update) => remote && routeRemoteTools
+    execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
       ? executeRemoteRead(id, params, signal, update)
       : localRead.execute(id, params, signal, update),
   });
-  pi.registerTool({ ...localWrite, execute: (id, params, signal, update) => remote && routeRemoteTools ? createWriteTool(localCwd, { operations: remoteWriteOps() }).execute(id, params, signal, update) : localWrite.execute(id, params, signal, update) });
-  pi.registerTool({ ...localEdit, execute: (id, params, signal, update) => remote && routeRemoteTools ? createEditTool(localCwd, { operations: remoteEditOps() }).execute(id, params, signal, update) : localEdit.execute(id, params, signal, update) });
+  pi.registerTool({ ...localWrite, execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path) ? createWriteTool(localCwd, { operations: remoteWriteOps() }).execute(id, params, signal, update) : localWrite.execute(id, params, signal, update) });
+  pi.registerTool({ ...localEdit, execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path) ? createEditTool(localCwd, { operations: remoteEditOps() }).execute(id, params, signal, update) : localEdit.execute(id, params, signal, update) });
   pi.registerTool({
     ...localBash,
     description: `Execute a shell command. Remote model-facing output returns at most the last ${DEFAULT_EXEC_MAX_LINES} lines or ${formatSize(DEFAULT_EXEC_MAX_BYTES)} by default; complete oversized output is saved locally.`,
@@ -1294,12 +1377,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "remote",
     label: "Remote",
-    description: "Connect, reconnect, annotate endpoints, manage server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Connections support SSH agent, password, or an explicit local private key with -i. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords and key passphrases are never accepted as arguments and are cached only in process memory.",
-    promptSnippet: "Control the configured remote SSH connection, endpoint note and memory, working directory, and local port forwarding",
+    description: "Connect, reconnect, annotate endpoints, locate server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Server memory is managed as JSON entries with Pi's read, write, and edit tools. Connections support SSH agent, password, or an explicit local private key with -i. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords and key passphrases are never accepted as arguments and are cached only in process memory.",
+    promptSnippet: "Control the configured remote SSH connection, endpoint note and memory location, working directory, and local port forwarding",
     promptGuidelines: [
       "Use remote when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
       "Use remote with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
-      "Use remote with action memory and no memory argument to inspect server memory. Non-empty memory text appends to the existing memory; clear it only by passing --clear explicitly.",
+      "Use remote with action memory to locate and inspect the current server-memory JSON file, then use read/edit/write on that exact local path for entry-level changes.",
+      "Delete a server-memory JSON entry only after an explicit user request to delete, remove, or forget it. Read the file first, identify the exact entry id, and remove only that object with edit; ask the user if the target is ambiguous and never infer deletion from an update request.",
       `Always set timeout for remote exec commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
       "Keep remote exec output narrow with tail, sed, rg limits, or similarly bounded commands; never cat large logs or emit broad file listings.",
       "Use remote with action disconnect after remote work when the user asks to return to the local environment.",
@@ -1308,7 +1392,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "memory"] as const),
       command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22 or ssh -i ~/.ssh/id_ed25519 root@host; optionally selects the endpoint for note or memory" })),
       note: Type.Optional(Type.String({ description: "Endpoint note for the note action; omit or use an empty string to clear it" })),
-      memory: Type.Optional(Type.String({ description: "Persistent context shared by the endpoint's user@host across SSH ports; omit to inspect, provide non-empty text to append without overwriting existing memory, or use --clear to clear explicitly" })),
       cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
       remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
@@ -1357,47 +1440,29 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (params.action === "note" || params.action === "memory") {
         const command = params.command || lastCommand || activeSshCommand();
         if (!command) throw new Error("No SSH endpoint configured; connect or select an endpoint first");
-        const label = parseSshCommand(command).label;
+        const parsed = parseSshCommand(command);
+        const label = parsed.label;
         if (params.action === "note") {
           const note = params.note?.trim() || undefined;
           saveEndpointConfig(command, { note });
-          if (remote && cacheId(remote) === cacheId(parseSshCommand(command)) && currentCtx) status(currentCtx);
+          if (remote && cacheId(remote) === cacheId(parsed) && currentCtx) status(currentCtx);
           return {
             content: [{ type: "text", text: note ? `SSH remote note updated (${label}): ${note}` : `SSH remote note cleared (${label})` }],
             details: { endpoint: label, note },
           };
         }
-        const parsed = parseSshCommand(command);
-        const server = serverMemoryId(parsed);
-        if (params.memory === undefined) {
-          const memory = endpointMemory(parsed);
-          return {
-            content: [{ type: "text", text: memory ? `SSH remote server memory (${server}):\n${memory}` : `No SSH remote server memory is configured (${server}).` }],
-            details: { endpoint: label, server, memory },
-          };
+        const path = ensureServerMemoryFile(parsed);
+        let memory: ServerMemoryFile | undefined;
+        try { memory = loadServerMemory(parsed); }
+        catch (error) {
+          throw new Error(`Invalid server-memory JSON at ${path}: ${(error as Error).message}`);
         }
-        const addition = params.memory.trim();
-        if (!addition) throw new Error("memory must contain text; omit it to inspect the current memory or use --clear to clear it explicitly");
-        if (addition.toLowerCase() === "--clear") {
-          saveServerMemory(command, undefined);
-          return {
-            content: [{ type: "text", text: `SSH remote server memory cleared (${server}).` }],
-            details: { endpoint: label, server, memory: undefined },
-          };
-        }
-        const currentMemory = endpointMemory(parsed);
-        const duplicate = currentMemory === addition || currentMemory?.endsWith(`\n\n${addition}`);
-        if (duplicate) {
-          return {
-            content: [{ type: "text", text: `SSH remote server memory already ends with this content (${server}); nothing was changed.` }],
-            details: { endpoint: label, server, memory: currentMemory, addedMemory: addition, changed: false },
-          };
-        }
-        const memory = currentMemory ? `${currentMemory}\n\n${addition}` : addition;
-        saveServerMemory(command, memory);
+        const text = memory?.entries.length
+          ? `SSH remote server memory (${serverMemoryId(parsed)}) is stored at ${path}:\n${JSON.stringify(memory.entries, null, 2)}`
+          : `No server-memory entries are configured for ${serverMemoryId(parsed)}. Use write to create ${path} with schema {"server":"${serverMemoryId(parsed)}","entries":[]}, then use edit for entry-level changes.`;
         return {
-          content: [{ type: "text", text: `SSH remote server memory appended (${server}). It applies to every port for this user and host.` }],
-          details: { endpoint: label, server, memory, addedMemory: addition, changed: true },
+          content: [{ type: "text", text }],
+          details: { endpoint: label, server: serverMemoryId(parsed), path, entries: memory?.entries ?? [] },
         };
       }
       if (params.action === "exec") {
@@ -1444,7 +1509,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("remote", {
-    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] [-i KEY] | config | use USER@HOST:PORT | config note TEXT|--clear | config memory TEXT|--clear | config cwd PATH | config display-lines N | config read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
+    description: "Connect over SSH and manage endpoints: /remote | ssh USER@HOST [-p PORT] [-i KEY] | memory | config | use USER@HOST:PORT | config note TEXT|--clear | config cwd PATH | config display-lines N | config read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes N | forward [MAPPINGS] | unforward | exec [--timeout SECONDS] [--lines N] COMMAND | cd PATH | status | reload | off | forget",
     handler: async (args, ctx) => {
       const input = args.trim().replace(/^\/?remote(?:\s+|$)/i, "").trim();
       const action = input.toLowerCase();
@@ -1453,8 +1518,18 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const rows = Object.entries(config.endpoints ?? {}).map(([key, endpoint]) => {
           const active = key === config.activeEndpoint ? "*" : " ";
           const command = endpoint.sshCommand || commandFromEndpointKey(key);
-          const memory = command ? endpointMemory(parseSshCommand(command), config) : undefined;
-          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    memory: ${memory || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
+          let memory = "none";
+          if (command) {
+            const parsed = parseSshCommand(command);
+            const path = serverMemoryFilePath(parsed);
+            try {
+              const entries = loadServerMemory(parsed)?.entries ?? [];
+              memory = `${entries.length} JSON entr${entries.length === 1 ? "y" : "ies"} (${path})`;
+            } catch (error) {
+              memory = `invalid JSON (${path}: ${(error as Error).message})`;
+            }
+          }
+          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    memory: ${memory}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
         });
         const limits = configuredOutputLimits(config);
         ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\nRead output: ${limits.readMaxLines} lines / ${formatSize(limits.readMaxBytes)}\nExec output: ${limits.execMaxLines} lines / ${formatSize(limits.execMaxBytes)}\nPer-turn output: ${formatSize(limits.turnMaxBytes)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
@@ -1508,15 +1583,19 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         ctx.ui.notify(note ? `SSH remote note updated (${parseSshCommand(command).label}): ${note}` : `SSH remote note cleared (${parseSshCommand(command).label})`, "info");
         return;
       }
-      if (/^config\s+memory(?:\s+|$)/i.test(input)) {
-        const value = input.replace(/^config\s+memory\s*/i, "").trim();
-        if (!value) { ctx.ui.notify("Use /remote config memory TEXT or /remote config memory --clear", "error"); return; }
-        const command = lastCommand || activeSshCommand();
+      if (action === "memory") {
+        const command = remote?.command || lastCommand || activeSshCommand();
         if (!command) { ctx.ui.notify("Configure an SSH endpoint first", "error"); return; }
-        const memory = value.toLowerCase() === "--clear" ? undefined : value;
-        const server = serverMemoryId(parseSshCommand(command));
-        saveServerMemory(command, memory);
-        ctx.ui.notify(memory ? `SSH remote server memory updated (${server}); it applies to every port` : `SSH remote server memory cleared (${server})`, "info");
+        const parsed = parseSshCommand(command);
+        let path: string;
+        try { path = ensureServerMemoryFile(parsed); }
+        catch (error) { ctx.ui.notify(`Could not initialize server-memory JSON: ${(error as Error).message}`, "error"); return; }
+        try {
+          const memory = loadServerMemory(parsed);
+          ctx.ui.notify(`SSH remote server memory (${serverMemoryId(parsed)})\nFile: ${path}\n\n${formatServerMemoryEntries(memory)}`, "info");
+        } catch (error) {
+          ctx.ui.notify(`Invalid server-memory JSON at ${path}: ${(error as Error).message}`, "error");
+        }
         return;
       }
       if (/^config\s+display-lines\s+/i.test(input)) {

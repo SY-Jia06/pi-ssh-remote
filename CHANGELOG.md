@@ -18,6 +18,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
+## [0.1.11] - 2026-08-16
+
+### Added
+
+- Added per-`user@host` server-memory JSON files with stable `id` and `content` entries, plus automatic migration from legacy string memories.
+- Added a local-path exception so Pi's normal `read`, `edit`, and `write` tools can manage the active server's memory file while other operations remain routed over SSH.
+- Added `/remote memory` to display the current server's memory entries, IDs, and JSON file path.
+
+### Changed
+
+- Replaced agent-side append/clear memory mutations with prompt-guided entry-level CRUD on the JSON file. Deletion instructions now require an explicit user request, an exact entry ID, and preservation of unrelated entries.
+- Removed `/remote config memory`; the dedicated `/remote memory` command now handles display, while the `remote` tool's `memory` action locates and inspects the JSON file.
+
+### Fixed
+
+- None.
+
 ## [0.1.10] - 2026-08-16
 
 ### Added
@@ -189,7 +206,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.7...v0.1.8
