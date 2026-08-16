@@ -1299,6 +1299,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use remote when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
       "Use remote with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
+      "Use remote with action memory and no memory argument to inspect server memory. Non-empty memory text appends to the existing memory; clear it only by passing --clear explicitly.",
       `Always set timeout for remote exec commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
       "Keep remote exec output narrow with tail, sed, rg limits, or similarly bounded commands; never cat large logs or emit broad file listings.",
       "Use remote with action disconnect after remote work when the user asks to return to the local environment.",
@@ -1307,7 +1308,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "memory"] as const),
       command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22 or ssh -i ~/.ssh/id_ed25519 root@host; optionally selects the endpoint for note or memory" })),
       note: Type.Optional(Type.String({ description: "Endpoint note for the note action; omit or use an empty string to clear it" })),
-      memory: Type.Optional(Type.String({ description: "Persistent context shared by the endpoint's user@host across SSH ports; omit or use an empty string to clear it" })),
+      memory: Type.Optional(Type.String({ description: "Persistent context shared by the endpoint's user@host across SSH ports; omit to inspect, provide non-empty text to append without overwriting existing memory, or use --clear to clear explicitly" })),
       cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
       remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
@@ -1366,12 +1367,37 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             details: { endpoint: label, note },
           };
         }
-        const memory = params.memory?.trim() || undefined;
-        const server = serverMemoryId(parseSshCommand(command));
+        const parsed = parseSshCommand(command);
+        const server = serverMemoryId(parsed);
+        if (params.memory === undefined) {
+          const memory = endpointMemory(parsed);
+          return {
+            content: [{ type: "text", text: memory ? `SSH remote server memory (${server}):\n${memory}` : `No SSH remote server memory is configured (${server}).` }],
+            details: { endpoint: label, server, memory },
+          };
+        }
+        const addition = params.memory.trim();
+        if (!addition) throw new Error("memory must contain text; omit it to inspect the current memory or use --clear to clear it explicitly");
+        if (addition.toLowerCase() === "--clear") {
+          saveServerMemory(command, undefined);
+          return {
+            content: [{ type: "text", text: `SSH remote server memory cleared (${server}).` }],
+            details: { endpoint: label, server, memory: undefined },
+          };
+        }
+        const currentMemory = endpointMemory(parsed);
+        const duplicate = currentMemory === addition || currentMemory?.endsWith(`\n\n${addition}`);
+        if (duplicate) {
+          return {
+            content: [{ type: "text", text: `SSH remote server memory already ends with this content (${server}); nothing was changed.` }],
+            details: { endpoint: label, server, memory: currentMemory, addedMemory: addition, changed: false },
+          };
+        }
+        const memory = currentMemory ? `${currentMemory}\n\n${addition}` : addition;
         saveServerMemory(command, memory);
         return {
-          content: [{ type: "text", text: memory ? `SSH remote server memory updated (${server}). It applies to every port for this user and host.` : `SSH remote server memory cleared (${server}).` }],
-          details: { endpoint: label, server, memory },
+          content: [{ type: "text", text: `SSH remote server memory appended (${server}). It applies to every port for this user and host.` }],
+          details: { endpoint: label, server, memory, addedMemory: addition, changed: true },
         };
       }
       if (params.action === "exec") {

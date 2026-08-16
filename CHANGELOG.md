@@ -18,6 +18,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
+## [0.1.10] - 2026-08-16
+
+### Added
+
+- None.
+
+### Changed
+
+- None.
+
+### Fixed
+
+- Prevented the agent-facing `memory` action from clearing or replacing server memory accidentally: omission now inspects the saved memory, non-empty text appends idempotently, empty text is rejected, and clearing requires an explicit `--clear` value.
+
 ## [0.1.9] - 2026-08-12
 
 ### Added
@@ -175,7 +189,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.6...v0.1.7

@@ -164,7 +164,7 @@ Forward the remote service on port 8000 to localhost:8000, but keep my coding
 tools on the local repository.
 ```
 
-These requests are handled through the agent-facing `remote` tool; slash commands are optional.
+These requests are handled through the agent-facing `remote` tool; slash commands are optional. For safety, calling its `memory` action without a `memory` argument only reads the current server memory. Non-empty text is appended to the existing memory instead of replacing it; retrying the same final entry is a no-op. Clearing still requires the explicit `--clear` value.
 
 ## Command reference
 
@@ -215,13 +215,13 @@ The extension currently supports direct SSH commands with `-p`, `-l`, and `-i`. 
 
 ## Releases
 
-Latest release: [v0.1.9](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.9)
+Latest release: [v0.1.10](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.10)
 
 | Version | Date | Highlights |
 |---|---|---|
+| [0.1.10](CHANGELOG.md#0110---2026-08-16) | 2026-08-16 | Safe inspect-by-default and append-only agent updates for server memory |
 | [0.1.9](CHANGELOG.md#019---2026-08-12) | 2026-08-12 | Stable deduplicated server-memory context and shorter footer labels |
 | [0.1.8](CHANGELOG.md#018---2026-08-10) | 2026-08-10 | Explicit private-key login, cross-port server memory, and the shorter `remote` tool name |
-| [0.1.7](CHANGELOG.md#017---2026-08-05) | 2026-08-05 | Session-aware SSH workspace restoration for new, forked, and resumed sessions |
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release history, including additions, behavior changes, and bug fixes.
 
