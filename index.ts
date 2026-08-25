@@ -726,7 +726,11 @@ function connect(config: ParsedSsh, authentication: SshAuthentication, fingerpri
       hostVerifier: (hash) => hash === fingerprint,
     };
     client.once("ready", () => resolve(client));
-    client.once("error", reject);
+    // ssh2 may emit a socket error followed by a protocol error while a
+    // connection is lost during handshake. Keep consuming client errors after
+    // the first one so EventEmitter does not turn the follow-up into an
+    // uncaught exception; rejecting an already-settled promise is a no-op.
+    client.on("error", reject);
     client.connect(options);
   });
 }

@@ -12,11 +12,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Changed
 
-- Simplified the server-memory documentation to focus on adding, listing, updating, and deleting entries without exposing implementation details.
+- None.
 
 ### Fixed
 
 - None.
+
+## [0.1.12] - 2026-08-25
+
+### Added
+
+- None.
+
+### Changed
+
+- Simplified the server-memory documentation to focus on adding, listing, updating, and deleting entries without exposing implementation details.
+
+### Fixed
+
+- Prevented follow-up SSH client errors during a connection loss before handshake from becoming an uncaught exception that exits Pi.
 
 ## [0.1.11] - 2026-08-16
 
@@ -206,7 +220,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - None.
 
-[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/petrichor20211/pi-ssh-remote/compare/v0.1.8...v0.1.9

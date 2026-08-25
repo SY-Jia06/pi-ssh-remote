@@ -234,13 +234,13 @@ The extension currently supports direct SSH commands with `-p`, `-l`, and `-i`. 
 
 ## Releases
 
-Latest release: [v0.1.11](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.11)
+Latest release: [v0.1.12](https://github.com/petrichor20211/pi-ssh-remote/releases/tag/v0.1.12)
 
 | Version | Date | Highlights |
 |---|---|---|
+| [0.1.12](CHANGELOG.md#0112---2026-08-25) | 2026-08-25 | Safe handling of repeated SSH errors when a connection is lost during handshake |
 | [0.1.11](CHANGELOG.md#0111---2026-08-16) | 2026-08-16 | JSON memory entries, prompt-guided CRUD, and `/remote memory` listing |
 | [0.1.10](CHANGELOG.md#0110---2026-08-16) | 2026-08-16 | Safe inspect-by-default and append-only agent updates for server memory |
-| [0.1.9](CHANGELOG.md#019---2026-08-12) | 2026-08-12 | Stable deduplicated server-memory context and shorter footer labels |
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release history, including additions, behavior changes, and bug fixes.
 

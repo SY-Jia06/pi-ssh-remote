@@ -1,7 +1,11 @@
-# Excludes installed dependencies, npm tarballs, logs, temporary files, and editor metadata from the pi-ssh-remote source repository.
+# Excludes installed dependencies, npm tarballs, logs, temporary files, task-delivery documents, and editor metadata from the pi-ssh-remote source repository.
 node_modules/
 *.tgz
 *.log
 .DS_Store
 .vscode/
 .idea/
+docs/SPEC.md
+docs/CHECKLIST.md
+docs/DEBUGLOG.md
+docs/CHECKLOG.md
