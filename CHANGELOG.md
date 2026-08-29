@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Added
 
-- None.
+- Added local OpenSSH configuration resolution via `ssh -G`, including SSH aliases and ProxyJump support through an `ssh -W` stream.
 
 ### Changed
 

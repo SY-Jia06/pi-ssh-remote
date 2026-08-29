@@ -7,9 +7,11 @@
  */
 
 import ssh2, { type Client as SshClient, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { execFileSync, spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
+import { Duplex } from "node:stream";
 import { tmpdir } from "node:os";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -40,8 +42,17 @@ interface ParsedSsh {
   port: number;
   username: string;
   identityFile?: string;
+  /** Original OpenSSH target, such as pimei01-jia or user@host. */
+  sshTarget: string;
+  /** Effective ProxyJump value from the local OpenSSH configuration. */
+  proxyJump?: string;
   label: string;
   command: string;
+}
+
+interface SshProxy {
+  socket: Duplex;
+  close: () => void;
 }
 
 interface RemoteState extends ParsedSsh {
@@ -147,18 +158,56 @@ function shellWords(input: string): string[] {
   return words;
 }
 
+interface OpenSshConfig {
+  hostname?: string;
+  port?: number;
+  user?: string;
+  identityFiles: string[];
+  identitiesOnly?: boolean;
+  proxyJump?: string;
+}
+
+function resolveOpenSshConfig(target: string, loginUser: string | undefined, port: number | undefined, identityFile: string | undefined): OpenSshConfig | undefined {
+  const args = ["-G"];
+  if (loginUser) args.push("-l", loginUser);
+  if (port !== undefined) args.push("-p", String(port));
+  if (identityFile) args.push("-i", identityFile);
+  args.push(target);
+  try {
+    const output = execFileSync("ssh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) as string;
+    const result: OpenSshConfig = { identityFiles: [] };
+    for (const line of output.split(/\r?\n/)) {
+      const match = line.match(/^(\S+)\s+(.*)$/);
+      if (!match) continue;
+      const [, key, value] = match;
+      if (key === "hostname") result.hostname = value;
+      else if (key === "port") result.port = Number(value);
+      else if (key === "user") result.user = value;
+      else if (key === "identityfile" && value !== "none") result.identityFiles.push(value);
+      else if (key === "identitiesonly") result.identitiesOnly = value === "yes";
+      else if (key === "proxyjump" && value !== "none") result.proxyJump = value;
+    }
+    return result;
+  } catch {
+    // Keep literal host behavior if OpenSSH is unavailable or rejects -G.
+    return undefined;
+  }
+}
+
 function parseSshCommand(command: string): ParsedSsh {
   const args = shellWords(command);
   if (args[0] !== "ssh") throw new Error("Command must start with ssh, for example: ssh root@host -p 22");
   let port = 22;
+  let explicitPort: number | undefined;
   let username = process.env.USER || "root";
+  let loginUser: string | undefined;
   let identityFile: string | undefined;
   let target: string | undefined;
   for (let i = 1; i < args.length; i++) {
     const arg = args[i]!;
-    if (arg === "-p") { port = Number(args[++i]); continue; }
-    if (arg.startsWith("-p") && arg.length > 2) { port = Number(arg.slice(2)); continue; }
-    if (arg === "-l") { username = args[++i] || username; continue; }
+    if (arg === "-p") { port = Number(args[++i]); explicitPort = port; continue; }
+    if (arg.startsWith("-p") && arg.length > 2) { port = Number(arg.slice(2)); explicitPort = port; continue; }
+    if (arg === "-l") { loginUser = args[++i] || username; username = loginUser; continue; }
     if (arg === "-i") {
       if (identityFile !== undefined) throw new Error("Only one SSH identity file may be specified");
       identityFile = args[++i];
@@ -174,15 +223,39 @@ function parseSshCommand(command: string): ParsedSsh {
     if (!target) target = arg;
     else throw new Error("Unexpected extra argument in SSH command");
   }
-  if (!target || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid SSH host or port");
+  if (!target || (explicitPort !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535))) throw new Error("Invalid SSH host or port");
   if (identityFile && identityFile !== "~" && !identityFile.startsWith("~/") && !isAbsolute(identityFile)) {
     throw new Error("SSH identity file must use an absolute path or ~/...");
   }
   const at = target.lastIndexOf("@");
-  const host = at >= 0 ? target.slice(at + 1) : target;
+  const requestedHost = at >= 0 ? target.slice(at + 1) : target;
   if (at >= 0) username = target.slice(0, at);
-  if (!host || !username) throw new Error("Invalid SSH username or host");
-  return { host, port, username, ...(identityFile ? { identityFile } : {}), label: `${username}@${host}:${port}`, command };
+  if (!requestedHost || !username) throw new Error("Invalid SSH username or host");
+
+  const sshConfig = resolveOpenSshConfig(target, loginUser, explicitPort, identityFile);
+  const usesOpenSshAlias = Boolean(sshConfig && (
+    Boolean(sshConfig.proxyJump) ||
+    sshConfig.hostname !== requestedHost ||
+    sshConfig.port !== undefined && sshConfig.port !== 22 ||
+    sshConfig.user !== undefined && sshConfig.user !== username ||
+    sshConfig.identitiesOnly === true
+  ));
+  const configuredIdentity = !identityFile && usesOpenSshAlias ? sshConfig?.identityFiles[0] : undefined;
+  const effectiveHost = sshConfig?.hostname || requestedHost;
+  const effectivePort = sshConfig?.port || port;
+  const effectiveUser = sshConfig?.user || username;
+  const proxyJump = sshConfig?.proxyJump;
+  if (!Number.isInteger(effectivePort) || effectivePort < 1 || effectivePort > 65535) throw new Error("Invalid SSH host or port");
+  return {
+    host: effectiveHost,
+    port: effectivePort,
+    username: effectiveUser,
+    ...(identityFile || configuredIdentity ? { identityFile: identityFile || configuredIdentity } : {}),
+    sshTarget: target,
+    ...(proxyJump ? { proxyJump } : {}),
+    label: usesOpenSshAlias ? target : `${effectiveUser}@${effectiveHost}:${effectivePort}`,
+    command,
+  };
 }
 
 function cacheId(config: ParsedSsh): string {
@@ -684,19 +757,77 @@ function renderRemoteControlResult(result: any, expanded: boolean, theme: any): 
   };
 }
 
+function createSshProxy(config: ParsedSsh): SshProxy | undefined {
+  if (!config.proxyJump) return undefined;
+  const jumps = config.proxyJump.split(",").map((value) => value.trim()).filter(Boolean);
+  if (!jumps.length) return undefined;
+
+  // OpenSSH owns the jump-host authentication and ProxyJump chain. ssh2 then
+  // speaks the final SSH protocol over the resulting raw socket.
+  const destination = jumps.at(-1)!;
+  const args = ["-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-W", `${config.host}:${config.port}`];
+  if (jumps.length > 1) args.push("-J", jumps.slice(0, -1).join(","));
+  args.push(destination);
+  const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  let closed = false;
+  const socket = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      if (child.stdin.destroyed) {
+        callback(new Error("SSH ProxyJump stdin is closed"));
+        return;
+      }
+      child.stdin.write(chunk, callback);
+    },
+  });
+  const proxyError = (error: Error) => {
+    if (!socket.destroyed) socket.destroy(error);
+  };
+  child.stdout.on("data", (chunk: Buffer) => socket.push(chunk));
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr = (stderr + chunk.toString()).slice(-4096);
+  });
+  child.stdin.on("error", proxyError);
+  child.stdout.on("error", proxyError);
+  child.on("error", proxyError);
+  child.on("exit", (code, signal) => {
+    if (closed || socket.destroyed) return;
+    if (code !== 0) {
+      const detail = stderr.trim();
+      socket.destroy(new Error(`SSH ProxyJump failed${detail ? `: ${detail}` : ` with exit code ${code ?? signal}`}`));
+    } else {
+      socket.push(null);
+    }
+  });
+  socket.once("close", () => {
+    if (closed) return;
+    closed = true;
+    if (!child.killed) child.kill();
+  });
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    socket.destroy();
+    if (!child.killed) child.kill();
+  };
+  return { socket, close };
+}
+
 function probeFingerprint(config: ParsedSsh): Promise<string> {
+  const proxy = createSshProxy(config);
   return new Promise((resolve, reject) => {
     const client = new Client();
     let settled = false;
     const timer = setTimeout(() => {
-      if (!settled) { settled = true; client.end(); reject(new Error("Connection timed out")); }
+      if (!settled) { settled = true; client.end(); proxy?.close(); reject(new Error("Connection timed out")); }
     }, 10000);
     client.on("error", (error) => {
-      if (!settled) { settled = true; clearTimeout(timer); reject(error); }
+      if (!settled) { settled = true; clearTimeout(timer); proxy?.close(); reject(error); }
     });
+    client.once("close", () => proxy?.close());
     client.connect({
-      host: config.host,
-      port: config.port,
+      ...(proxy ? { sock: proxy.socket } : { host: config.host, port: config.port }),
       username: config.username,
       readyTimeout: 8000,
       hostHash: "sha256",
@@ -712,11 +843,11 @@ function probeFingerprint(config: ParsedSsh): Promise<string> {
 type SshAuthentication = Partial<Pick<ConnectConfig, "password" | "privateKey" | "passphrase" | "agent">>;
 
 function connect(config: ParsedSsh, authentication: SshAuthentication, fingerprint: string): Promise<SshClient> {
+  const proxy = createSshProxy(config);
   return new Promise((resolve, reject) => {
     const client = new Client();
     const options: ConnectConfig = {
-      host: config.host,
-      port: config.port,
+      ...(proxy ? { sock: proxy.socket } : { host: config.host, port: config.port }),
       username: config.username,
       ...authentication,
       readyTimeout: 12000,
@@ -726,12 +857,16 @@ function connect(config: ParsedSsh, authentication: SshAuthentication, fingerpri
       hostVerifier: (hash) => hash === fingerprint,
     };
     client.once("ready", () => resolve(client));
+    client.once("close", () => proxy?.close());
     // ssh2 may emit a socket error followed by a protocol error while a
     // connection is lost during handshake. Keep consuming client errors after
     // the first one so EventEmitter does not turn the follow-up into an
     // uncaught exception; rejecting an already-settled promise is a no-op.
     client.on("error", reject);
     client.connect(options);
+  }).catch((error) => {
+    proxy?.close();
+    throw error;
   });
 }
 
@@ -1522,18 +1657,19 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const rows = Object.entries(config.endpoints ?? {}).map(([key, endpoint]) => {
           const active = key === config.activeEndpoint ? "*" : " ";
           const command = endpoint.sshCommand || commandFromEndpointKey(key);
+          let parsedEndpoint: ParsedSsh | undefined;
           let memory = "none";
           if (command) {
-            const parsed = parseSshCommand(command);
-            const path = serverMemoryFilePath(parsed);
+            parsedEndpoint = parseSshCommand(command);
+            const path = serverMemoryFilePath(parsedEndpoint);
             try {
-              const entries = loadServerMemory(parsed)?.entries ?? [];
+              const entries = loadServerMemory(parsedEndpoint)?.entries ?? [];
               memory = `${entries.length} JSON entr${entries.length === 1 ? "y" : "ies"} (${path})`;
             } catch (error) {
               memory = `invalid JSON (${path}: ${(error as Error).message})`;
             }
           }
-          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    memory: ${memory}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
+          return `${active} ${parsedEndpoint?.label || key}\n    note: ${endpoint.note || "none"}\n    memory: ${memory}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}`;
         });
         const limits = configuredOutputLimits(config);
         ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\nRead output: ${limits.readMaxLines} lines / ${formatSize(limits.readMaxBytes)}\nExec output: ${limits.execMaxLines} lines / ${formatSize(limits.execMaxBytes)}\nPer-turn output: ${formatSize(limits.turnMaxBytes)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
@@ -1553,7 +1689,17 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const requested = input.replace(/^(?:config\s+)?use\s+/i, "").trim();
         const config = loadRemoteConfig();
         const keys = Object.keys(config.endpoints ?? {});
-        const matches = keys.filter((key) => key === requested || key.startsWith(requested));
+        const matches = keys.filter((key) => {
+          if (key === requested || key.startsWith(requested)) return true;
+          const command = config.endpoints?.[key]?.sshCommand;
+          if (!command) return false;
+          try {
+            const parsed = parseSshCommand(command);
+            return parsed.label === requested || parsed.sshTarget === requested;
+          } catch {
+            return false;
+          }
+        });
         if (matches.length !== 1) {
           ctx.ui.notify(matches.length ? `Endpoint name is ambiguous: ${matches.join(", ")}` : `Endpoint not found: ${requested}`, "error");
           return;

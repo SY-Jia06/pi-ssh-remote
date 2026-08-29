@@ -58,7 +58,7 @@ Tunnel mode forwards remote services to localhost while returning Pi's tools to 
 pi install npm:pi-ssh-remote
 ```
 
-Requires Node.js 20+. The remote server must provide Bash, SFTP, and GNU `timeout`.
+Requires Node.js 20+. Using SSH aliases or ProxyJump also requires the local OpenSSH client. The remote server must provide Bash, SFTP, and GNU `timeout`.
 
 ## Quick start
 
@@ -228,9 +228,24 @@ Saved global values include endpoints, active endpoint, notes, remote working di
 
 New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
 
-## Current SSH scope
+## OpenSSH configuration and ProxyJump
 
-The extension currently supports direct SSH commands with `-p`, `-l`, and `-i`. It does not yet consume `~/.ssh/config` or ProxyJump settings; use `-i` explicitly instead of relying on an `IdentityFile` entry.
+The extension resolves `~/.ssh/config` through the local `ssh -G` command, so SSH aliases, `HostName`, `User`, `Port`, `IdentityFile`, and `ProxyJump` can be used directly. The final SSH session is still established by the extension's `ssh2` client; ProxyJump is carried by a local OpenSSH `ssh -W` stream.
+
+For example, an alias such as this can be used directly:
+
+```sshconfig
+Host build-server
+    HostName build.example.com
+    User alice
+    ProxyJump bastion
+```
+
+```text
+/remote ssh build-server
+```
+
+Jump-host authentication uses the local OpenSSH configuration, SSH agent, or keys. To avoid an uncontrolled password prompt inside the Pi TUI, ProxyJump hosts must authenticate non-interactively; the target host's password or encrypted private-key passphrase is still prompted by the extension when needed. The command parser still accepts only `-p`, `-l`, and `-i` directly; other SSH options are not passed through.
 
 ## Releases
 

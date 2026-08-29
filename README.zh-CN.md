@@ -92,7 +92,7 @@ H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 pi install npm:pi-ssh-remote
 ```
 
-本地要求 Node.js 20+。远程服务器需要提供 Bash、SFTP 和 GNU `timeout`。
+本地要求 Node.js 20+。使用 SSH 别名或 ProxyJump 时，还需要本机的 OpenSSH 客户端。远程服务器需要提供 Bash、SFTP 和 GNU `timeout`。
 
 ## 快速开始
 
@@ -306,9 +306,24 @@ pi install npm:pi-ssh-remote
 - 各项限制可以配置，但不能超过扩展的硬安全上限；
 - 折叠显示行数最大为 50，只影响界面，不会增加模型输出。
 
-## 当前限制
+## SSH 配置与 ProxyJump
 
-目前只支持 SSH 直连，以及 `-p`、`-l`、`-i` 参数。暂不读取 `~/.ssh/config` 或 ProxyJump；如需指定私钥，请显式使用 `-i`，不要依赖 SSH config 中的 `IdentityFile`。
+插件会通过本机的 `ssh -G` 解析 `~/.ssh/config`，因此可以直接使用 SSH 别名、`HostName`、`User`、`Port`、`IdentityFile` 和 `ProxyJump`。最终的 SSH 会话仍由插件的 `ssh2` 建立；ProxyJump 链路由本机 OpenSSH 以 `ssh -W` 方式承载。
+
+例如，下面这样的别名可以直接使用：
+
+```sshconfig
+Host build-server
+    HostName build.example.com
+    User alice
+    ProxyJump bastion
+```
+
+```text
+/remote ssh build-server
+```
+
+跳板机认证使用本机 OpenSSH 的配置、SSH Agent 或密钥。为避免在 Pi TUI 中出现不可控的密码提示，ProxyJump 跳板机必须能够非交互式认证；目标服务器的密码或加密私钥 passphrase 仍由插件在 Pi 中询问。当前仍只接受 `-p`、`-l` 和 `-i` 作为命令行参数，不支持把任意其他 SSH 选项直接传给插件。
 
 ## 版本发布
 
