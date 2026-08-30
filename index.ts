@@ -835,6 +835,36 @@ function previewRemoteOutput(output: string, displayLines: number): string {
   return truncateTail(output, { maxLines: displayLines, maxBytes: DEFAULT_MAX_BYTES }).content || "Remote command completed.";
 }
 
+function renderRemoteControlCall(args: any, theme: any): Component {
+  const action = typeof args?.action === "string" ? args.action : "status";
+  const context = [
+    args?.cwd ? `cwd=${args.cwd}` : undefined,
+    args?.endpoints?.length ? `endpoints=${args.endpoints.join(",")}` : undefined,
+    args?.group ? `group=${args.group}` : undefined,
+    args?.session ? `session=${args.session}` : undefined,
+    args?.background && !args?.session ? "background" : undefined,
+    args?.log ? `log=${args.log}` : undefined,
+    args?.timeout ? `timeout=${args.timeout}s` : undefined,
+    args?.env && Object.keys(args.env).length ? `env=${Object.keys(args.env).join(",")}` : undefined,
+  ].filter(Boolean).join(" ");
+  const detail = action === "exec" || action === "fanout"
+    ? args?.remoteCommand ? `$ ${args.remoteCommand}` : undefined
+    : action === "connect" || action === "note" || action === "memory"
+      ? args?.command
+      : action === "chdir"
+        ? args?.cwd
+        : action === "forward"
+          ? args?.forwards
+          : action === "artifact"
+            ? args?.artifactRef
+            : action === "job_status"
+              ? args?.jobId
+              : undefined;
+  const title = theme.fg("toolTitle", theme.bold(`remote ${action}`));
+  const metadata = context ? ` ${theme.fg("muted", context)}` : "";
+  return new Text(`${title}${metadata}${detail ? `\n${theme.fg("toolOutput", detail)}` : ""}`, 0, 0);
+}
+
 function renderRemoteControlResult(result: any, expanded: boolean, theme: any): Component {
   const fallback = result.content?.find((item: any) => item.type === "text")?.text ?? "";
   const details = result.details;
@@ -2028,6 +2058,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       const state = await connectInteractive(command, ctx, params.cwd ?? configuredCwd(command));
       if (!state) throw new Error(lastConnectionError || "SSH remote connection was cancelled or failed");
       return { content: [{ type: "text", text: `Connected: ${endpointDisplayLabel(state)}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
+    },
+    renderCall(args, theme) {
+      return renderRemoteControlCall(args, theme);
     },
     renderResult(result, { expanded }, theme) {
       return renderRemoteControlResult(result, expanded, theme);

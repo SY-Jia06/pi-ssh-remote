@@ -19,7 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Fixed
 
-- None.
+- Remote tool blocks now show the requested action, execution context, and shell command instead of displaying only `remote` above the output.
 
 ## [0.1.12] - 2026-08-25
 
