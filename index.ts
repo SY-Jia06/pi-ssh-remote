@@ -1164,6 +1164,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   let routeRemoteTools = false;
   let currentCtx: any;
   let reconnectPromise: Promise<RemoteState> | null = null;
+  let connectionGeneration = 0;
+  let interactiveConnectGeneration: number | undefined;
   const forwardServers = new Map<number, Server>();
   const forwardSpecs = new Map<number, ForwardSpec>();
   const forwardSockets = new Map<Server, Set<Socket>>();
@@ -1382,7 +1384,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const attachClient = (state: RemoteState) => {
     const { client } = state;
     client.on("close", () => {
-      if (remote?.client !== client) return;
+      if (remote?.client !== client || interactiveConnectGeneration !== undefined) return;
       if (currentCtx) {
         currentCtx.ui.setStatus("ssh-remote", currentCtx.ui.theme.fg("warning", `reconnecting ${endpointDisplayLabel(state)}…`));
       }
@@ -1411,17 +1413,22 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   async function reconnectRemote(): Promise<RemoteState> {
     if (reconnectPromise) return reconnectPromise;
+    const generation = connectionGeneration;
     const resumeRouting = remote ? routeRemoteTools : (credentialCache.resume?.routeRemoteTools ?? true);
     const source = remote ?? (credentialCache.resume ? { ...parseSshCommand(credentialCache.resume.command), cwd: credentialCache.resume.cwd } : null);
     if (!source) throw new Error("No SSH remote connection is available to reconnect");
     const parsed = parseSshCommand(source.command);
     const password = getCachedPassword(parsed);
-    reconnectPromise = (async () => {
+    const pending = (async () => {
       const authentication = parsed.identityFile
         ? await privateKeyAuthentication(parsed)
         : standardAuthentication(password);
       const oldClient = remote?.client;
       const next = await establish(parsed, authentication, source.cwd);
+      if (generation !== connectionGeneration) {
+        next.client.end();
+        throw new Error("SSH reconnection was superseded by another workspace action");
+      }
       remote = next;
       routeRemoteTools = resumeRouting;
       credentialCache.resume = { command: parsed.command, cwd: next.cwd, routeRemoteTools, forwards: credentialCache.resume?.forwards };
@@ -1431,8 +1438,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         currentCtx.ui.notify(`SSH remote reconnected automatically: ${endpointDisplayLabel(next)}:${next.cwd}`, "info");
       }
       return next;
-    })().finally(() => { reconnectPromise = null; });
-    return reconnectPromise;
+    })();
+    reconnectPromise = pending;
+    const clearPending = () => { if (reconnectPromise === pending) reconnectPromise = null; };
+    void pending.then(clearPending, clearPending);
+    return pending;
   }
 
   const withReconnect = async <T>(operation: (client: SshClient) => Promise<T>): Promise<T> => {
@@ -1488,6 +1498,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return null;
     }
 
+    const previous = remote;
+    const previousRouting = routeRemoteTools;
+    const generation = ++connectionGeneration;
+    interactiveConnectGeneration = generation;
     let password = getCachedPassword(parsed);
     ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `connecting ${endpointDisplayLabel(parsed)}…`));
     try {
@@ -1500,20 +1514,29 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       } catch (error) {
         if (parsed.identityFile || !/authentication methods failed|authentication failure/i.test((error as Error).message)) throw error;
         password = await askPassword(ctx) ?? undefined;
-        if (!password) {
-          lastConnectionError = "No SSH password was provided and SSH agent authentication failed";
-          status(ctx);
-          return null;
-        }
+        if (!password) throw new Error("No SSH password was provided and SSH agent authentication failed");
         authentication = standardAuthentication(password);
         next = await establish(parsed, authentication, cwd ?? configuredCwd(command));
       }
-      const previous = remote?.client;
+      if (generation !== connectionGeneration) {
+        next.client.end();
+        throw new Error("SSH connection attempt was superseded by another workspace action");
+      }
+      if (previous && cacheId(previous) !== cacheId(next)) await stopForwards();
+      if (generation !== connectionGeneration) {
+        next.client.end();
+        throw new Error("SSH connection attempt was superseded by another workspace action");
+      }
       remote = next;
       routeRemoteTools = true;
-      previous?.end();
+      previous?.client.end();
       if (!parsed.identityFile && password) setCachedPassword(parsed, password);
-      credentialCache.resume = { command, cwd: next.cwd, routeRemoteTools, forwards: [] };
+      credentialCache.resume = {
+        command,
+        cwd: next.cwd,
+        routeRemoteTools,
+        forwards: [...forwardSpecs.values()].map(serializeForward),
+      };
       lastCommand = command;
       lastConnectionError = undefined;
       saveEndpointConfig(command, { remoteCwd: next.cwd }, true);
@@ -1522,12 +1545,17 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       ctx.ui.notify(`SSH remote connected: ${endpointDisplayLabel(next)}:${next.cwd}`, "info");
       return next;
     } catch (error) {
-      if (!parsed.identityFile) deleteCachedPassword(parsed);
-      remote = null;
-      lastConnectionError = (error as Error).message;
-      status(ctx);
-      ctx.ui.notify(`SSH remote connection failed: ${lastConnectionError}`, "error");
+      if (generation === connectionGeneration) {
+        if (!parsed.identityFile) deleteCachedPassword(parsed);
+        remote = previous;
+        routeRemoteTools = previous ? previousRouting : false;
+        lastConnectionError = (error as Error).message;
+        status(ctx);
+        ctx.ui.notify(`SSH remote connection failed: ${lastConnectionError}`, "error");
+      }
       return null;
+    } finally {
+      if (interactiveConnectGeneration === generation) interactiveConnectGeneration = undefined;
     }
   };
 
@@ -1621,13 +1649,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     status(ctx);
   };
 
-  const disconnect = (ctx: any, forgetCredentials = false) => {
+  const disconnect = async (ctx: any, forgetCredentials = false): Promise<void> => {
+    connectionGeneration++;
     const previous = remote;
     remote = null;
     routeRemoteTools = false;
     reconnectPromise = null;
     credentialCache.resume = undefined;
-    void stopForwards();
+    await stopForwards();
     if (forgetCredentials) {
       const configured = previous ?? (() => {
         const command = activeSshCommand();
@@ -1810,7 +1839,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         return { content: [{ type: "text", text }], details: { connected: Boolean(remote), cwd: remote?.cwd, toolRouting: routeRemoteTools ? "remote" : "local", forwardedPorts: mappings } };
       }
       if (params.action === "disconnect" || params.action === "forget") {
-        disconnect(ctx, params.action === "forget");
+        await disconnect(ctx, params.action === "forget");
         return { content: [{ type: "text", text: params.action === "forget" ? "Disconnected and forgot the cached credentials." : "Disconnected from SSH remote and returned to local tools." }], details: { connected: false } };
       }
       if (params.action === "reconnect") {
@@ -2134,8 +2163,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const command = `ssh ${sshArguments}`;
         try { parseSshCommand(command); }
         catch (error) { ctx.ui.notify((error as Error).message, "error"); return; }
-        saveEndpointConfig(command, {}, true);
-        lastCommand = command;
         await connectInteractive(command, ctx);
         return;
       }
@@ -2162,6 +2189,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const command = config.endpoints?.[key]?.sshCommand;
         if (!command) { ctx.ui.notify(`Endpoint has no SSH command: ${key}`, "error"); return; }
         if (remote && cacheId(remote) !== key) {
+          connectionGeneration++;
           const previous = remote;
           remote = null;
           routeRemoteTools = false;
@@ -2296,8 +2324,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         } catch (error) { ctx.ui.notify(`SSH remote command failed: ${(error as Error).message}`, "error"); }
         return;
       }
-      if (["off", "disconnect", "exit"].includes(action)) { disconnect(ctx); return; }
-      if (action === "forget") { disconnect(ctx, true); return; }
+      if (["off", "disconnect", "exit"].includes(action)) { await disconnect(ctx); return; }
+      if (action === "forget") { await disconnect(ctx, true); return; }
       if (action === "status") {
         ctx.ui.notify(remote ? `${endpointDisplayLabel(remote)}:${remote.cwd}` : "SSH remote is disconnected", "info");
         return;
@@ -2354,6 +2382,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", async (event) => {
     sessionReady = false;
+    connectionGeneration++;
     const previous = remote;
     const preserveConnection = event.reason === "reload" || event.reason === "new" || event.reason === "fork";
     if (previous && preserveConnection) {

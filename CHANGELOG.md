@@ -21,6 +21,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 - Remote tool blocks now show the requested action, execution context, and shell command instead of displaying only `remote` above the output.
 - Port-forward startup now rejects conflicting reuse of a local port, rolls back partial multi-forward failures, and closes active tunnel sockets without hanging shutdown.
+- Failed endpoint switches now preserve the working SSH workspace; successful cross-endpoint switches close stale tunnels, and disconnect/session changes can no longer be undone by a late automatic reconnect.
 
 ## [0.1.12] - 2026-08-25
 
