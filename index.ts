@@ -1166,6 +1166,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   let reconnectPromise: Promise<RemoteState> | null = null;
   const forwardServers = new Map<number, Server>();
   const forwardSpecs = new Map<number, ForwardSpec>();
+  const forwardSockets = new Map<Server, Set<Socket>>();
   let sessionReady = false;
   let restoringSessionState = false;
   let lastConnectionError: string | undefined;
@@ -1540,9 +1541,16 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return state;
   };
 
-  const startForward = async (spec: ForwardSpec): Promise<void> => {
-    if (forwardServers.has(spec.localPort)) return;
+  const startForward = async (spec: ForwardSpec): Promise<boolean> => {
+    const existing = forwardSpecs.get(spec.localPort);
+    if (existing) {
+      if (serializeForward(existing) === serializeForward(spec)) return false;
+      throw new Error(`Local port ${spec.localPort} is already forwarded to ${existing.remoteHost}:${existing.remotePort}`);
+    }
     const server = createServer((socket: Socket) => {
+      const sockets = forwardSockets.get(server);
+      sockets?.add(socket);
+      socket.once("close", () => sockets?.delete(socket));
       void withReconnect((client) => new Promise<ClientChannel>((resolve, reject) =>
         client.forwardOut("127.0.0.1", 0, spec.remoteHost, spec.remotePort, (error, stream) =>
           error ? reject(error) : resolve(stream)))).then((stream) => {
@@ -1551,24 +1559,50 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             socket.pipe(stream).pipe(socket);
           }, () => socket.destroy());
     });
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error) => { server.close(); reject(error); };
-      server.once("error", onError);
-      server.listen(spec.localPort, "127.0.0.1", () => {
-        server.off("error", onError);
-        server.on("error", () => {});
-        resolve();
+    forwardSockets.set(server, new Set());
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error) => reject(error);
+        server.once("error", onError);
+        server.listen(spec.localPort, "127.0.0.1", () => {
+          server.off("error", onError);
+          server.on("error", () => {});
+          resolve();
+        });
       });
-    });
+    } catch (error) {
+      forwardSockets.delete(server);
+      throw error;
+    }
     forwardServers.set(spec.localPort, server);
     forwardSpecs.set(spec.localPort, spec);
+    return true;
   };
 
-  const stopForwards = async (): Promise<void> => {
-    const servers = [...forwardServers.values()];
-    forwardServers.clear();
-    forwardSpecs.clear();
-    await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  const stopForwards = async (ports = [...forwardServers.keys()]): Promise<void> => {
+    const servers = ports.flatMap((port) => {
+      const server = forwardServers.get(port);
+      if (!server) return [];
+      forwardServers.delete(port);
+      forwardSpecs.delete(port);
+      return [server];
+    });
+    await Promise.all(servers.map((server) => new Promise<void>((done) => {
+      server.close(() => done());
+      for (const socket of forwardSockets.get(server) ?? []) socket.destroy();
+      server.closeAllConnections?.();
+      forwardSockets.delete(server);
+    })));
+  };
+
+  const startForwards = async (specs: ForwardSpec[]): Promise<void> => {
+    const started: number[] = [];
+    try {
+      for (const spec of specs) if (await startForward(spec)) started.push(spec.localPort);
+    } catch (error) {
+      await stopForwards(started);
+      throw error;
+    }
   };
 
   const restoreSessionRemoteState = async (saved: SessionRemoteState, ctx: any): Promise<void> => {
@@ -1582,7 +1616,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (!next) throw new Error(lastConnectionError || "SSH remote session restore was cancelled or failed");
     routeRemoteTools = saved.routeRemoteTools ?? true;
     const specs = (saved.forwards ?? []).map(parseForwardSpec);
-    for (const spec of specs) await startForward(spec);
+    await startForwards(specs);
     credentialCache.resume = { command, cwd: next.cwd, routeRemoteTools, forwards: [...forwardSpecs.values()].map(serializeForward) };
     status(ctx);
   };
@@ -1794,7 +1828,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const values = params.forwards?.trim().split(/\s+/).filter(Boolean) ?? configuredForwards(state.command);
         if (!values.length) throw new Error(`No port mappings configured in ${REMOTE_CONFIG_FILE}`);
         const specs = values.map(parseForwardSpec);
-        for (const spec of specs) await startForward(spec);
+        await startForwards(specs);
         routeRemoteTools = false;
         credentialCache.resume = { command: state.command, cwd: state.cwd, routeRemoteTools, forwards: [...forwardSpecs.values()].map(serializeForward) };
         if (currentCtx) status(currentCtx);
@@ -2217,7 +2251,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           const values = supplied ? supplied.split(/\s+/) : configuredForwards(state.command);
           if (!values.length) throw new Error("No port forwards configured; use /remote config forward LOCAL_PORT:REMOTE_HOST:REMOTE_PORT");
           const specs = values.map(parseForwardSpec);
-          for (const spec of specs) await startForward(spec);
+          await startForwards(specs);
           routeRemoteTools = false;
           credentialCache.resume = { command: state.command, cwd: state.cwd, routeRemoteTools, forwards: [...forwardSpecs.values()].map(serializeForward) };
           status(ctx);
