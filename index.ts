@@ -752,7 +752,6 @@ function changedStatus(previous: Record<string, unknown> | undefined, current: R
 class RemoteExecAccumulator {
   private chunks: Buffer[] = [];
   private tail = Buffer.alloc(0);
-  private stderrTail = Buffer.alloc(0);
   private outputFile: { path: string; fd: number } | undefined;
   private totalBytes = 0;
   private newlineCount = 0;
@@ -780,8 +779,7 @@ class RemoteExecAccumulator {
   }
 
   appendStderr(chunk: Buffer): void {
-    this.stderrTail = Buffer.concat([this.stderrTail, chunk]);
-    if (this.stderrTail.length > this.maxBytes) this.stderrTail = this.stderrTail.subarray(this.stderrTail.length - this.maxBytes);
+    this.append(chunk);
   }
 
   private ensureOutputFile(): string {
@@ -793,7 +791,7 @@ class RemoteExecAccumulator {
     return this.outputFile.path;
   }
 
-  finish() {
+  finish(exitCode = 0) {
     const totalLines = this.totalBytes ? this.newlineCount + (this.lastByte === 10 ? 0 : 1) : 0;
     const source = this.outputFile ? this.tail.toString("utf8") : Buffer.concat(this.chunks).toString("utf8");
     const contentBudget = Math.max(1, this.maxBytes - OUTPUT_FOOTER_RESERVE_BYTES);
@@ -816,11 +814,7 @@ class RemoteExecAccumulator {
       text += `\n\n[Showing lines ${startLine}-${totalLines} of ${totalLines} (${formatSize(this.maxBytes)} model-output limit). Full output: ${fullOutputPath}]`;
     }
     this.close();
-    return { exitCode: 0, text, content, truncation, fullOutputPath };
-  }
-
-  errorMessage(): string {
-    return this.stderrTail.toString("utf8").trim();
+    return { exitCode, text, content, truncation, fullOutputPath };
   }
 
   close(): void {
@@ -1099,12 +1093,8 @@ function execRemoteLimited(
           fail(new Error(`Remote command timed out after ${resolvedTimeout} seconds`));
           return;
         }
-        if (code !== 0) {
-          fail(new Error(accumulator.errorMessage() || `Remote command exited with code ${code}`));
-          return;
-        }
         settled = true;
-        resolve(accumulator.finish());
+        resolve(accumulator.finish(code ?? 255));
       });
     });
   });
@@ -1962,6 +1952,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             50,
             16 * 1024,
           ));
+          if (metrics.exitCode !== 0) throw new Error(`statusCommand exited with code ${metrics.exitCode}: ${metrics.content}`);
           if (metrics.truncation.truncated) throw new Error("statusCommand JSON exceeds 50 lines or 16KB");
           const parsed = JSON.parse(metrics.content);
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("statusCommand must return one JSON object");
@@ -2014,7 +2005,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
               : formatted.content;
             return {
               endpoint: selected.parsed.label,
-              ok: true,
+              ok: formatted.exitCode === 0,
               exitCode: formatted.exitCode,
               output,
               ...(artifactRef ? { artifactRef, totalLines: formatted.truncation.totalLines, totalBytes: formatted.truncation.totalBytes } : {}),
@@ -2061,6 +2052,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             20,
             DEFAULT_LONG_OUTPUT_SUMMARY_BYTES,
           ));
+          if (launched.exitCode !== 0) throw new Error(`Background launch exited with code ${launched.exitCode}: ${launched.content}`);
           const pidMatch = launched.content.match(/(?:^|\n)pid=(\d+)/);
           const pid = pidMatch ? Number(pidMatch[1]) : undefined;
           const job: RemoteJob = {
@@ -2096,7 +2088,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             `${artifactRef ? ` artifact_ref=${artifactRef}` : ""} cursor=${tracked.cursor}` +
             `${tail ? `\ntail:\n${tail}` : ""}`;
         } else {
-          text = `${tracked.output || "No new output."}\n[cursor=${tracked.cursor}${artifactRef ? ` artifact_ref=${artifactRef}` : ""}]`;
+          text = `${tracked.output || "No new output."}\n[exit_code=${formatted.exitCode} cursor=${tracked.cursor}${artifactRef ? ` artifact_ref=${artifactRef}` : ""}]`;
         }
         return limitRemoteToolResult({
           content: [{ type: "text", text }],
@@ -2108,6 +2100,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             modelLines,
             modelBytes,
             output: text,
+            exitCode: formatted.exitCode,
             cursor: tracked.cursor,
             artifactRef,
             modelLimited: true,
@@ -2320,7 +2313,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             ? `\n\n[Showing last ${Math.min(displayLines, formatted.truncation.totalLines)} of ${formatted.truncation.totalLines} lines]`
             : "";
           const fullOutput = formatted.fullOutputPath ? `\n[Full output: ${formatted.fullOutputPath}]` : "";
-          ctx.ui.notify(`${preview}${omitted}${fullOutput}`, "info");
+          const exitCode = formatted.exitCode === 0 ? "" : `\n[Exit code: ${formatted.exitCode}]`;
+          ctx.ui.notify(`${preview}${omitted}${fullOutput}${exitCode}`, formatted.exitCode === 0 ? "info" : "error");
         } catch (error) { ctx.ui.notify(`SSH remote command failed: ${(error as Error).message}`, "error"); }
         return;
       }
