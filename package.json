@@ -13,11 +13,15 @@
   ],
   "files": [
     "index.ts",
+    "route-identity.js",
     "README.md",
     "README.zh-CN.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test"
+  },
   "engines": {
     "node": ">=20"
   },

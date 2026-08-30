@@ -300,21 +300,21 @@ Agent 可直接传 `env`、`group`、`background`、`session`、`log`，无需�
 - 命令预览设置；
 - 模型输出预算。
 
-此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。
+每条解析后的 SSH 路由（原始 target、ProxyJump 链以及最终 user／host／port）分别保存 endpoint 状态、凭据、目标主机信任、job、cursor 和服务器记忆；旧 endpoint 与记忆记录会在使用时迁移为路由专属记录。此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。
 
 私钥内容、密码和密钥 passphrase 都不会写入配置文件。插件仅在连接时从本地读取私钥；手动输入的密码和 passphrase 只会缓存在当前 Pi 进程的内存中。
 
 ## 安全与输出限制
 
-- 第一次连接新服务器时，需要确认主机密钥；
-- 主机密钥发生变化时，会再次要求确认；
+- 第一次连接新的 SSH 路由时，需要确认目标主机密钥；
+- 该路由的目标主机密钥发生变化时，会再次要求确认；
 - 远程命令默认 30 秒超时；
 - 远程文本读取默认最多返回 400 行或 16 KB，并支持通过 `offset`/`limit` 继续读取；
 - 远程命令默认使用 200 行／8 KB 模型输出预算；
 - 超限时模型只收到最后 8 行／2 KB 摘要和 `artifactRef`；
 - 同一轮所有远端工具默认共享 32 KB 模型输出预算；
 - 文本范围读取不会先通过 SFTP 下载完整远程文件；
-- 超限命令完整 stdout 流式写入权限受限的本地 artifact；
+- 超限命令的完整 stdout／stderr 合并流会写入权限受限的本地 artifact；
 - `displayLines` 只影响界面，`modelLines`／`modelBytes` 控制模型输出；
 - cursor、artifact 引用和 job ID 在当前 Pi 进程内有效。
 
@@ -335,7 +335,7 @@ Host build-server
 /remote ssh build-server
 ```
 
-跳板机认证使用本机 OpenSSH 的配置、SSH Agent 或密钥。为避免在 Pi TUI 中出现不可控的密码提示，ProxyJump 跳板机必须能够非交互式认证；目标服务器的密码或加密私钥 passphrase 仍由插件在 Pi 中询问。当前仍只接受 `-p`、`-l` 和 `-i` 作为命令行参数，不支持把任意其他 SSH 选项直接传给插件。
+跳板机认证使用本机 OpenSSH 的配置、SSH Agent 或密钥。为避免在 Pi TUI 中出现不可控提示，每台 ProxyJump 跳板机都必须已存在于本机 OpenSSH `known_hosts` 且能够非交互式认证；未知或发生变化的跳板机密钥会被拒绝。目标服务器的密码或加密私钥 passphrase 仍由插件在 Pi 中询问。当前仍只接受 `-p`、`-l` 和 `-i` 作为命令行参数，不支持把任意其他 SSH 选项直接传给插件。
 
 ## 版本发布
 

@@ -35,6 +35,7 @@ import {
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
+import { sshRouteId } from "./route-identity.js";
 
 const { Client, utils: ssh2Utils } = ssh2;
 
@@ -309,11 +310,15 @@ function parseSshCommand(command: string): ParsedSsh {
 }
 
 function cacheId(config: ParsedSsh): string {
-  return `${config.username}@${config.host}:${config.port}`;
+  return sshRouteId(config);
+}
+
+function legacyServerMemoryId(config: ParsedSsh): string {
+  return `${config.username}@${config.host}`;
 }
 
 function serverMemoryId(config: ParsedSsh): string {
-  return `${config.username}@${config.host}`;
+  return cacheId(config);
 }
 
 function getCachedPassword(config: ParsedSsh): string | undefined {
@@ -456,29 +461,36 @@ function commandFromEndpointKey(key: string): string | undefined {
 }
 
 function normalizeRemoteConfig(config: RemoteConfig): RemoteConfig {
-  const endpoints = { ...(config.endpoints ?? {}) };
+  const endpoints: Record<string, RemoteEndpointConfig> = {};
   const serverMemories = Object.fromEntries(
     Object.entries(config.serverMemories ?? {})
       .filter((entry): entry is [string, string] => typeof entry[1] === "string" && Boolean(entry[1].trim()))
       .map(([key, memory]) => [key, memory.trim()]),
   );
-  const endpointEntries = Object.entries(endpoints).sort(([left], [right]) =>
+  let activeEndpoint: string | undefined;
+  const endpointEntries = Object.entries(config.endpoints ?? {}).sort(([left], [right]) =>
     left === config.activeEndpoint ? -1 : right === config.activeEndpoint ? 1 : 0,
   );
-  for (const [key, endpoint] of endpointEntries) {
-    const command = endpoint.sshCommand || commandFromEndpointKey(key);
+  for (const [oldKey, endpoint] of endpointEntries) {
+    const command = endpoint.sshCommand || commandFromEndpointKey(oldKey);
     const { memory: legacyMemory, ...endpointWithoutMemory } = endpoint;
+    let key = oldKey;
+    let parsed: ParsedSsh | undefined;
+    if (command) {
+      try {
+        parsed = parseSshCommand(command);
+        key = cacheId(parsed);
+      } catch {}
+    }
     endpoints[key] = {
       ...endpointWithoutMemory,
       ...(command ? { sshCommand: command } : {}),
+      ...(endpoints[key] ?? {}),
     };
-    if (legacyMemory?.trim() && command) {
-      try { serverMemories[serverMemoryId(parseSshCommand(command))] ??= legacyMemory.trim(); }
-      catch {}
-    }
+    if (oldKey === config.activeEndpoint) activeEndpoint = key;
+    if (legacyMemory?.trim() && parsed) serverMemories[serverMemoryId(parsed)] ??= legacyMemory.trim();
   }
 
-  let activeEndpoint = config.activeEndpoint;
   if (config.sshCommand) {
     try {
       const key = cacheId(parseSshCommand(config.sshCommand));
@@ -566,6 +578,20 @@ function writeServerMemoryFile(path: string, memory: ServerMemoryFile): void {
   writeFileSync(path, JSON.stringify(memory, null, 2) + "\n", { mode: 0o600 });
 }
 
+function migrateLegacyServerMemoryFile(endpoint: ParsedSsh): string {
+  const path = serverMemoryFilePath(endpoint);
+  if (existsSync(path)) return path;
+  const legacyServer = legacyServerMemoryId(endpoint);
+  const legacyPath = serverMemoryFilePath(legacyServer);
+  if (!existsSync(legacyPath)) return path;
+  const legacy = JSON.parse(readFileSync(legacyPath, "utf8")) as Partial<ServerMemoryFile>;
+  if (legacy.server !== legacyServer || !Array.isArray(legacy.entries)) {
+    throw new Error(`legacy server-memory file ${legacyPath} has an invalid server or entries field`);
+  }
+  writeServerMemoryFile(path, { server: serverMemoryId(endpoint), entries: legacy.entries as ServerMemoryEntry[] });
+  return path;
+}
+
 function migrateLegacyServerMemories(): void {
   const config = loadRemoteConfig();
   const legacy = config.serverMemories ?? {};
@@ -590,13 +616,13 @@ function migrateLegacyServerMemories(): void {
 }
 
 function ensureServerMemoryFile(endpoint: ParsedSsh): string {
-  const path = serverMemoryFilePath(endpoint);
+  const path = migrateLegacyServerMemoryFile(endpoint);
   if (!existsSync(path)) writeServerMemoryFile(path, { server: serverMemoryId(endpoint), entries: [] });
   return path;
 }
 
 function loadServerMemory(endpoint: ParsedSsh): ServerMemoryFile | undefined {
-  const path = serverMemoryFilePath(endpoint);
+  const path = migrateLegacyServerMemoryFile(endpoint);
   if (!existsSync(path)) return undefined;
   const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<ServerMemoryFile>;
   if (parsed.server !== serverMemoryId(endpoint) || !Array.isArray(parsed.entries)) {
@@ -670,6 +696,15 @@ function saveKnownHost(key: string, fingerprint: string): void {
   hosts[key] = fingerprint;
   mkdirSync(dirname(KNOWN_HOSTS_FILE), { recursive: true });
   writeFileSync(KNOWN_HOSTS_FILE, JSON.stringify(hosts, null, 2) + "\n", { mode: 0o600 });
+}
+
+function legacyHostTrustId(config: ParsedSsh): string {
+  return `${config.host}:${config.port}`;
+}
+
+function trustedFingerprint(config: ParsedSsh): string | undefined {
+  const hosts = loadKnownHosts();
+  return hosts[cacheId(config)] ?? hosts[legacyHostTrustId(config)];
 }
 
 function displayFingerprint(hex: string): string {
@@ -1026,19 +1061,23 @@ function probeFingerprint(config: ParsedSsh): Promise<string> {
 }
 
 async function trustHostInteractive(config: ParsedSsh, ctx: any): Promise<void> {
-  const key = `${config.host}:${config.port}`;
-  const saved = loadKnownHosts()[key];
+  const key = cacheId(config);
+  const hosts = loadKnownHosts();
+  const routeFingerprint = hosts[key];
+  const saved = routeFingerprint ?? hosts[legacyHostTrustId(config)];
   const fingerprint = await probeFingerprint(config);
   if (!saved) {
-    const trusted = await ctx.ui.confirm("Trust SSH host", `${config.label}\nHost key: ${displayFingerprint(fingerprint)}\nTrust and save this key?`);
+    const trusted = await ctx.ui.confirm("Trust SSH host", `${config.label}\nHost key: ${displayFingerprint(fingerprint)}\nTrust and save this key for this SSH route?`);
     if (!trusted) throw new Error("The host key was not trusted");
     saveKnownHost(key, fingerprint);
   } else if (saved !== fingerprint) {
     const trusted = await ctx.ui.confirm(
       "SSH host key changed",
-      `${config.label}\nPrevious key: ${displayFingerprint(saved)}\nNew key: ${displayFingerprint(fingerprint)}\nVerify the server identity. Update the saved key and continue?`,
+      `${config.label}\nPrevious key: ${displayFingerprint(saved)}\nNew key: ${displayFingerprint(fingerprint)}\nVerify this SSH route. Update its saved key and continue?`,
     );
     if (!trusted) throw new Error("The changed host key was rejected");
+    saveKnownHost(key, fingerprint);
+  } else if (!routeFingerprint) {
     saveKnownHost(key, fingerprint);
   }
 }
@@ -1438,11 +1477,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   };
 
   const establish = async (parsed: ParsedSsh, authentication: SshAuthentication, cwd: string): Promise<RemoteState> => {
-    const key = `${parsed.host}:${parsed.port}`;
-    const fingerprint = loadKnownHosts()[key];
-    if (!fingerprint) throw new Error(`Host ${key} is not trusted; connect interactively with /remote first`);
+    const key = cacheId(parsed);
+    const routeTrusted = loadKnownHosts()[key];
+    const fingerprint = routeTrusted ?? trustedFingerprint(parsed);
+    if (!fingerprint) throw new Error(`SSH route ${parsed.label} is not trusted; connect interactively with /remote first`);
     const client = await connect(parsed, authentication, fingerprint);
     try {
+      if (!routeTrusted) saveKnownHost(key, fingerprint);
       const cdCommand = cwd === FALLBACK_REMOTE_CWD ? "cd -- ~" : `cd -- ${quote(cwd)}`;
       const resolved = (await execRemote(client, `${cdCommand} && pwd -P`)).toString().trim();
       const state = { ...parsed, client, cwd: resolved };
@@ -2043,7 +2084,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         for (const selector of selectors) {
           try {
             const selected = configuredEndpoint(selector);
-            if ((!remote || cacheId(remote) !== cacheId(selected.parsed)) && !loadKnownHosts()[`${selected.parsed.host}:${selected.parsed.port}`]) {
+            if ((!remote || cacheId(remote) !== cacheId(selected.parsed)) && !trustedFingerprint(selected.parsed)) {
               await trustHostInteractive(selected.parsed, ctx);
             }
           } catch {}
