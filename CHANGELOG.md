@@ -9,10 +9,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 ### Added
 
 - Added local OpenSSH configuration resolution via `ssh -G`, including SSH aliases and ProxyJump support through an `ssh -W` stream.
+- Added per-call `modelLines`/`modelBytes`, incremental output cursors, and bounded artifact reads.
+- Added structured background launches with environment, Unix group, tmux session, and log fields plus change-only `job_status` checks.
+- Added compact concurrent `fanout` execution across saved endpoints.
 
 ### Changed
 
-- None.
+- Oversized command output now defaults to a compact tail summary and `artifactRef` instead of sending the full configured tail to the model.
 
 ### Fixed
 

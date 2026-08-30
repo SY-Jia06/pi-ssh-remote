@@ -35,7 +35,7 @@ Each `user@host:port` endpoint remembers its remote working directory, note, and
 
 ### Resilient and bounded by default
 
-Dropped connections are automatically re-established during the active session. SSH workspace state is also session-aware: `/new` inherits the current workspace, forks and clones retain their source workspace, and `/resume` restores the selected session's recorded endpoint, remote directory, routing mode, and forwards. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges instead of downloading complete files, command output is streamed through bounded buffers, and a 32 KB per-turn budget prevents parallel tools from flooding model context. Complete oversized command output is preserved in a permission-restricted temporary file.
+Dropped connections are automatically re-established during the active session. SSH workspace state is also session-aware: `/new` inherits the current workspace, forks and clones retain their source workspace, and `/resume` restores the selected session's recorded endpoint, remote directory, routing mode, and forwards. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges, command output uses bounded buffers, and a 32 KB per-turn budget protects model context. Oversized output returns a short tail plus an `artifactRef`; repeated polls can use a cursor to return only new output.
 
 ### Hybrid local/remote workflows
 
@@ -58,7 +58,7 @@ Tunnel mode forwards remote services to localhost while returning Pi's tools to 
 pi install npm:pi-ssh-remote
 ```
 
-Requires Node.js 20+. Using SSH aliases or ProxyJump also requires the local OpenSSH client. The remote server must provide Bash, SFTP, and GNU `timeout`.
+Requires Node.js 20+. Using SSH aliases or ProxyJump also requires the local OpenSSH client. The remote server must provide Bash, SFTP, and GNU `timeout`; structured `session` launches additionally require tmux.
 
 ## Quick start
 
@@ -135,7 +135,7 @@ and report the PID, output directory, and log path. Verify that the process is
 still alive and that the log has started.
 ```
 
-The default foreground timeout prevents an accidental long-running command from occupying the agent indefinitely, while an explicitly backgrounded job continues on the server.
+The agent can pass `env`, `group`, `background`, `session`, and `log` as structured fields, avoiding nested shell quoting. The returned `jobId` can be polled with `job_status`, which reports only changed state.
 
 ### 3. Keep several machines understandable
 
@@ -216,6 +216,17 @@ tools on the local repository.
 | `/remote off` | Disconnect and return tools to local execution |
 | `/remote forget` | Disconnect and clear cached passwords and key passphrases |
 
+### Agent tool additions
+
+The `remote` tool also supports:
+
+- `modelLines` and `modelBytes` for per-call model-output limits;
+- `sinceCursor` for incremental repeats of the same command;
+- structured `env`, `group`, `background`, `session`, and `log` fields;
+- `artifact` to read a bounded range from an oversized command's `artifactRef`;
+- `job_status` for tracked background jobs, optional GPU metrics, and optional JSON metrics;
+- `fanout` to run one foreground command concurrently across up to 16 saved endpoints and return compact JSON.
+
 ## Persistence, output, and security
 
 Endpoint configuration is stored locally in:
@@ -226,7 +237,7 @@ Endpoint configuration is stored locally in:
 
 Saved global values include endpoints, active endpoint, notes, remote working directories, forwards, identity file paths, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Private key contents, passwords, and key passphrases are **never written to this file**. Private keys are read locally only when connecting; prompted passwords and passphrases remain only in process memory.
 
-New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
+New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote commands use a 200-line/8-KB model budget, and all remote tools in one turn share 32 KB. Oversized commands show only an 8-line/2-KB tail summary and store complete stdout in a permission-restricted local artifact. Read it through `artifactRef`; local paths are not required. `displayLines` affects only collapsed UI, while `modelLines`/`modelBytes` control model-facing output. Cursors, artifact references, and tracked job IDs live for the current Pi process.
 
 ## OpenSSH configuration and ProxyJump
 

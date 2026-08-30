@@ -8,6 +8,7 @@
 
 import ssh2, { type Client as SshClient, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
@@ -64,6 +65,30 @@ interface CredentialCache {
   passwords: Map<string, string>;
   keyPassphrases: Map<string, string>;
   resume?: { command: string; cwd: string; routeRemoteTools: boolean; forwards?: string[] };
+}
+
+interface OutputCursor {
+  endpoint: string;
+  command: string;
+  cwd: string;
+  output: string;
+}
+
+interface RemoteJob {
+  id: string;
+  endpoint: string;
+  cwd: string;
+  log: string;
+  pid?: number;
+  session?: string;
+  startedAt: string;
+  lastStatus?: Record<string, unknown>;
+}
+
+interface RuntimeCache {
+  cursors: Map<string, OutputCursor>;
+  artifacts: Map<string, string>;
+  jobs: Map<string, RemoteJob>;
 }
 
 interface RemoteEndpointConfig {
@@ -134,11 +159,25 @@ const OUTPUT_FOOTER_RESERVE_BYTES = 512;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
 const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
 const MAX_PRIVATE_KEY_BYTES = 1024 * 1024;
+const MAX_RUNTIME_ENTRIES = 128;
+const DEFAULT_LONG_OUTPUT_SUMMARY_LINES = 8;
+const DEFAULT_LONG_OUTPUT_SUMMARY_BYTES = 2 * 1024;
+const DEFAULT_FANOUT_LINES = 12;
+const DEFAULT_FANOUT_BYTES = 2 * 1024;
 const SESSION_STATE_ENTRY_TYPE = "pi-ssh-remote-state";
 const CACHE_KEY = "__piHpcCredentialCacheV1";
-const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
+const RUNTIME_CACHE_KEY = "__piSshRemoteRuntimeCacheV1";
+const cacheHost = globalThis as typeof globalThis & {
+  [CACHE_KEY]?: CredentialCache;
+  [RUNTIME_CACHE_KEY]?: RuntimeCache;
+};
 const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>(), keyPassphrases: new Map<string, string>() };
 credentialCache.keyPassphrases ??= new Map<string, string>();
+const runtimeCache = cacheHost[RUNTIME_CACHE_KEY] ??= {
+  cursors: new Map<string, OutputCursor>(),
+  artifacts: new Map<string, string>(),
+  jobs: new Map<string, RemoteJob>(),
+};
 
 function shellWords(input: string): string[] {
   const words: string[] = [];
@@ -639,6 +678,77 @@ function saveOutput(output: string): string {
   return file.path;
 }
 
+function trimRuntimeMap<T>(values: Map<string, T>): void {
+  while (values.size > MAX_RUNTIME_ENTRIES) values.delete(values.keys().next().value!);
+}
+
+function registerArtifact(path: string): string {
+  const ref = `out_${randomUUID().slice(0, 8)}`;
+  runtimeCache.artifacts.set(ref, path);
+  trimRuntimeMap(runtimeCache.artifacts);
+  return ref;
+}
+
+function outputDelta(previous: string, current: string): string {
+  if (previous === current) return "";
+  if (current.startsWith(previous)) return current.slice(previous.length).replace(/^\r?\n/, "");
+  const before = previous.replace(/\r?\n$/, "").split(/\r?\n/);
+  const after = current.replace(/\r?\n$/, "").split(/\r?\n/);
+  for (let overlap = Math.min(before.length, after.length); overlap > 0; overlap--) {
+    let matches = true;
+    for (let index = 0; index < overlap; index++) {
+      if (before[before.length - overlap + index] !== after[index]) { matches = false; break; }
+    }
+    if (matches) return after.slice(overlap).join("\n");
+  }
+  return current;
+}
+
+function validateEnvironment(value: unknown): Record<string, string> {
+  if (value === undefined) return {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("env must be an object of string values");
+  const env: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid environment variable name: ${key}`);
+    if (typeof item !== "string") throw new Error(`Environment value for ${key} must be a string`);
+    env[key] = item;
+  }
+  return env;
+}
+
+function structuredRemoteCommand(command: string, envValue: unknown, groupValue: unknown): string {
+  const env = validateEnvironment(envValue);
+  let result = command;
+  if (Object.keys(env).length) {
+    const assignments = Object.entries(env).map(([key, value]) => `${key}=${quote(value)}`).join(" ");
+    result = `env ${assignments} bash -lc ${quote(result)}`;
+  }
+  if (groupValue !== undefined) {
+    if (typeof groupValue !== "string" || !/^[A-Za-z_][A-Za-z0-9_-]*$/.test(groupValue)) {
+      throw new Error("group must be a valid Unix group name");
+    }
+    result = `sg ${quote(groupValue)} -c ${quote(result)}`;
+  }
+  return result;
+}
+
+function validateSessionName(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^[A-Za-z0-9_.-]+$/.test(value)) {
+    throw new Error("session may contain only letters, digits, dot, underscore, and hyphen");
+  }
+  return value;
+}
+
+function changedStatus(previous: Record<string, unknown> | undefined, current: Record<string, unknown>): Record<string, unknown> {
+  if (!previous) return current;
+  const changed: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(current)])) {
+    if (JSON.stringify(previous[key]) !== JSON.stringify(current[key])) changed[key] = current[key] ?? null;
+  }
+  return changed;
+}
+
 class RemoteExecAccumulator {
   private chunks: Buffer[] = [];
   private tail = Buffer.alloc(0);
@@ -706,7 +816,7 @@ class RemoteExecAccumulator {
       text += `\n\n[Showing lines ${startLine}-${totalLines} of ${totalLines} (${formatSize(this.maxBytes)} model-output limit). Full output: ${fullOutputPath}]`;
     }
     this.close();
-    return { text, content, truncation, fullOutputPath };
+    return { exitCode: 0, text, content, truncation, fullOutputPath };
   }
 
   errorMessage(): string {
@@ -733,7 +843,7 @@ function renderRemoteControlResult(result: any, expanded: boolean, theme: any): 
   const output = details.output || fallback;
   const displayLines = details.displayLines || DEFAULT_DISPLAY_LINES;
   const warnings = [
-    ...(details.fullOutputPath ? [`Full output: ${details.fullOutputPath}`] : []),
+    ...(details.artifactRef ? [`Artifact: ${details.artifactRef}`] : details.fullOutputPath ? [`Full output: ${details.fullOutputPath}`] : []),
     ...(details.truncation?.truncated ? [`Truncated: showing ${details.truncation.outputLines} of ${details.truncation.totalLines} lines`] : []),
   ];
   const warning = warnings.length ? warnings.join(". ") : undefined;
@@ -751,7 +861,8 @@ function renderRemoteControlResult(result: any, expanded: boolean, theme: any): 
       const hint = skipped > 0
         ? [theme.fg("muted", `... (${skipped} earlier lines, ${keyHint("app.tools.expand", "to expand")})`)]
         : [];
-      return [...hint, ...shown, ...(warning ? [theme.fg("warning", `[${warning}]`)] : [])];
+      const warningLine = warning && theme.fg("warning", truncateToWidth(`[${warning}]`, width, ""));
+      return [...hint, ...shown, ...(warningLine ? [warningLine] : [])];
     },
     invalidate() {},
   };
@@ -838,6 +949,24 @@ function probeFingerprint(config: ParsedSsh): Promise<string> {
       },
     });
   });
+}
+
+async function trustHostInteractive(config: ParsedSsh, ctx: any): Promise<void> {
+  const key = `${config.host}:${config.port}`;
+  const saved = loadKnownHosts()[key];
+  const fingerprint = await probeFingerprint(config);
+  if (!saved) {
+    const trusted = await ctx.ui.confirm("Trust SSH host", `${config.label}\nHost key: ${displayFingerprint(fingerprint)}\nTrust and save this key?`);
+    if (!trusted) throw new Error("The host key was not trusted");
+    saveKnownHost(key, fingerprint);
+  } else if (saved !== fingerprint) {
+    const trusted = await ctx.ui.confirm(
+      "SSH host key changed",
+      `${config.label}\nPrevious key: ${displayFingerprint(saved)}\nNew key: ${displayFingerprint(fingerprint)}\nVerify the server identity. Update the saved key and continue?`,
+    );
+    if (!trusted) throw new Error("The changed host key was rejected");
+    saveKnownHost(key, fingerprint);
+  }
 }
 
 type SshAuthentication = Partial<Pick<ConnectConfig, "password" | "privateKey" | "passphrase" | "agent">>;
@@ -1019,6 +1148,52 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const configuredForwards = (command: string): string[] =>
     endpointConfig(loadRemoteConfig(), command).forwards ?? [];
 
+  const executionCwd = (state: ParsedSsh & { cwd: string }, requested?: string): string =>
+    !requested ? state.cwd : requested.startsWith("/") ? posix.normalize(requested) : posix.resolve(state.cwd, requested);
+
+  const updateOutputCursor = (
+    state: ParsedSsh,
+    command: string,
+    cwd: string,
+    output: string,
+    sinceCursor?: string,
+  ): { cursor: string; output: string } => {
+    const endpoint = cacheId(state);
+    if (sinceCursor) {
+      const previous = runtimeCache.cursors.get(sinceCursor);
+      if (!previous) throw new Error(`Unknown or expired output cursor: ${sinceCursor}`);
+      if (previous.endpoint !== endpoint || previous.command !== command || previous.cwd !== cwd) {
+        throw new Error("Output cursor belongs to a different endpoint, command, or working directory");
+      }
+      const delta = outputDelta(previous.output, output);
+      runtimeCache.cursors.delete(sinceCursor);
+      runtimeCache.cursors.set(sinceCursor, { endpoint, command, cwd, output });
+      return { cursor: sinceCursor, output: delta };
+    }
+    const cursor = `cur_${randomUUID().slice(0, 8)}`;
+    runtimeCache.cursors.set(cursor, { endpoint, command, cwd, output });
+    trimRuntimeMap(runtimeCache.cursors);
+    return { cursor, output };
+  };
+
+  const configuredEndpoint = (selector: string): { parsed: ParsedSsh; cwd: string } => {
+    if (selector.trim().startsWith("ssh ")) {
+      const parsed = parseSshCommand(selector.trim());
+      return { parsed, cwd: configuredCwd(parsed.command) };
+    }
+    const config = loadRemoteConfig();
+    const matches = Object.entries(config.endpoints ?? {}).flatMap(([key, endpoint]) => {
+      const command = endpoint.sshCommand || commandFromEndpointKey(key);
+      if (!command) return [];
+      const parsed = parseSshCommand(command);
+      return key === selector || parsed.label === selector || parsed.sshTarget === selector
+        ? [{ parsed, cwd: endpoint.remoteCwd || FALLBACK_REMOTE_CWD }]
+        : [];
+    });
+    if (matches.length !== 1) throw new Error(matches.length ? `Endpoint is ambiguous: ${selector}` : `Endpoint not found: ${selector}`);
+    return matches[0]!;
+  };
+
   const standardAuthentication = (password?: string): SshAuthentication => ({
     ...(password ? { password } : {}),
     ...(process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
@@ -1045,6 +1220,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
     return { privateKey: keyData, ...(passphrase ? { passphrase } : {}) };
   };
+
+  const cachedAuthentication = (parsed: ParsedSsh): Promise<SshAuthentication> =>
+    parsed.identityFile
+      ? privateKeyAuthentication(parsed)
+      : Promise.resolve(standardAuthentication(getCachedPassword(parsed)));
 
   const mapPath = (path: string): string => {
     if (!remote) return path;
@@ -1097,11 +1277,18 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return undefined;
   };
 
-  const limitRemoteToolResult = (result: any, kind: "read" | "exec", startLine = 1, requestedMaxLines?: number) => {
+  const limitRemoteToolResult = (
+    result: any,
+    kind: "read" | "exec",
+    startLine = 1,
+    requestedMaxLines?: number,
+    requestedMaxBytes?: number,
+  ) => {
     const limits = configuredOutputLimits();
     const configuredMaxBytes = kind === "read" ? limits.readMaxBytes : limits.execMaxBytes;
     const configuredMaxLines = kind === "read" ? limits.readMaxLines : limits.execMaxLines;
-    const maxLines = Math.min(configuredMaxLines, requestedMaxLines ?? configuredMaxLines);
+    const maxLines = requestedMaxLines ?? configuredMaxLines;
+    const selectedMaxBytes = requestedMaxBytes ?? configuredMaxBytes;
     const remaining = Math.max(0, limits.turnMaxBytes - turnOutputBytes);
     if (remaining < MIN_MODEL_OUTPUT_BYTES) {
       const text = `[Remote tool output omitted because this turn has used its ${formatSize(limits.turnMaxBytes)} model-output budget. Run a narrower follow-up command.]`;
@@ -1109,7 +1296,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return { ...result, content: [{ type: "text", text }], details: { ...(result.details ?? {}), turnBudgetExceeded: true } };
     }
 
-    const maxBytes = Math.min(configuredMaxBytes, remaining);
+    const maxBytes = Math.min(selectedMaxBytes, remaining);
     const textIndex = result.content?.findIndex((item: any) => item.type === "text") ?? -1;
     if (textIndex < 0) return result;
     const original = result.content[textIndex].text ?? "";
@@ -1120,6 +1307,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       : truncateTail(original, { maxLines, maxBytes: contentBudget });
     let text = truncation.content;
     let fullOutputPath = result.details?.fullOutputPath as string | undefined;
+    let artifactRef = result.details?.artifactRef as string | undefined;
     if (truncation.firstLineExceedsLimit) {
       text = `[Line ${startLine} exceeds the ${formatSize(maxBytes)} remote read limit. Use bash with sed/head -c to inspect a bounded fragment.]`;
     } else if (truncation.truncated) {
@@ -1128,7 +1316,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         text += `\n\n[Showing ${truncation.outputLines} lines (${formatSize(maxBytes)} remote read limit). Use offset=${nextOffset} to continue.]`;
       } else {
         fullOutputPath ??= saveOutput(original);
-        text += `\n\n[Showing the last ${truncation.outputLines} lines (${formatSize(maxBytes)} remote exec limit). Full output: ${fullOutputPath}]`;
+        artifactRef ??= registerArtifact(fullOutputPath);
+        const tail = truncateTail(truncation.content, {
+          maxLines: DEFAULT_LONG_OUTPUT_SUMMARY_LINES,
+          maxBytes: Math.min(DEFAULT_LONG_OUTPUT_SUMMARY_BYTES, contentBudget),
+        }).content;
+        text = `output_truncated lines=${truncation.totalLines} bytes=${truncation.totalBytes} artifact_ref=${artifactRef}` +
+          `${tail ? `\ntail:\n${tail}` : ""}`;
       }
     }
     const content = [...result.content];
@@ -1142,6 +1336,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         ...(result.details ?? {}),
         ...(truncation.truncated ? { truncation } : {}),
         ...(fullOutputPath ? { fullOutputPath } : {}),
+        ...(artifactRef ? { artifactRef } : {}),
       },
     };
   };
@@ -1256,20 +1451,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
     lastConnectionError = undefined;
 
-    const key = `${parsed.host}:${parsed.port}`;
-    const savedFingerprint = loadKnownHosts()[key];
-    const fingerprint = await probeFingerprint(parsed);
-    if (!savedFingerprint) {
-      const trusted = await ctx.ui.confirm("Trust SSH host", `${parsed.label}\nHost key: ${displayFingerprint(fingerprint)}\nTrust and save this key?`);
-      if (!trusted) { lastConnectionError = "The host key was not trusted"; return null; }
-      saveKnownHost(key, fingerprint);
-    } else if (savedFingerprint !== fingerprint) {
-      const trusted = await ctx.ui.confirm(
-        "SSH host key changed",
-        `${parsed.label}\nPrevious key: ${displayFingerprint(savedFingerprint)}\nNew key: ${displayFingerprint(fingerprint)}\nVerify the server identity. Update the saved key and continue?`,
-      );
-      if (!trusted) { lastConnectionError = "The changed host key was rejected"; return null; }
-      saveKnownHost(key, fingerprint);
+    try { await trustHostInteractive(parsed, ctx); }
+    catch (error) {
+      lastConnectionError = (error as Error).message;
+      return null;
     }
 
     let password = getCachedPassword(parsed);
@@ -1516,26 +1701,43 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "remote",
     label: "Remote",
-    description: "Connect, reconnect, annotate endpoints, locate server-specific memory, change the persistent remote working directory, inspect, forward ports, run remote SSH commands, or disconnect the configured SSH environment. Server memory is managed as JSON entries with Pi's read, write, and edit tools. Connections support SSH agent, password, or an explicit local private key with -i. Exec output is streamed to bounded buffers; model output defaults to the last 200 lines or 8KB, while complete oversized output is saved locally. Passwords and key passphrases are never accepted as arguments and are cached only in process memory.",
-    promptSnippet: "Control the configured remote SSH connection, endpoint note and memory location, working directory, and local port forwarding",
+    description: "Control persistent SSH workspaces, run bounded commands, launch and inspect background jobs, read saved output artifacts, or fan out one command across saved endpoints. Exec supports structured env, group, tmux session, log, model-output limits, and incremental cursors. Oversized output returns a compact summary plus artifactRef. Passwords and key passphrases stay in process memory.",
+    promptSnippet: "Control SSH workspaces, bounded exec, background jobs, output artifacts, and multi-endpoint fan-out",
     promptGuidelines: [
       "Use remote when the user asks the agent to enter, reconnect, inspect, or leave a remote SSH environment.",
       "Use remote with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
+      "Use remote exec env/background/session/log/group fields instead of building nested shell quoting for long jobs.",
+      "For repeated log polls, pass the previous exec result's cursor as sinceCursor; use action artifact with artifactRef for a bounded range of full oversized output.",
+      "Use remote job_status for tracked background jobs and fanout for one compact parallel check across several saved endpoints.",
       "Use remote with action memory to locate and inspect the current server-memory JSON file, then use read/edit/write on that exact local path for entry-level changes.",
       "Delete a server-memory JSON entry only after an explicit user request to delete, remove, or forget it. Read the file first, identify the exact entry id, and remove only that object with edit; ask the user if the target is ambiguous and never infer deletion from an update request.",
-      `Always set timeout for remote exec commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
-      "Keep remote exec output narrow with tail, sed, rg limits, or similarly bounded commands; never cat large logs or emit broad file listings.",
+      `Always set timeout for remote exec and fanout commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
       "Use remote with action disconnect after remote work when the user asks to return to the local environment.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "memory"] as const),
-      command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22 or ssh -i ~/.ssh/id_ed25519 root@host; optionally selects the endpoint for note or memory" })),
-      note: Type.Optional(Type.String({ description: "Endpoint note for the note action; omit or use an empty string to clear it" })),
-      cwd: Type.Optional(Type.String({ description: "Remote working directory; required for chdir, and a one-command override for exec" })),
-      forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings; defaults to ssh-remote-config.json" })),
-      remoteCommand: Type.Optional(Type.String({ description: "Remote shell command for the exec action" })),
-      timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_REMOTE_TIMEOUT_SECONDS, description: `Remote command timeout in seconds; defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS}` })),
-      displayLines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_DISPLAY_LINES, description: "Collapsed visual lines for exec output; defaults to the /remote config display-lines setting (5 initially), maximum 50" })),
+      action: StringEnum(["connect", "reconnect", "status", "disconnect", "forget", "forward", "unforward", "exec", "artifact", "job_status", "fanout", "chdir", "note", "memory"] as const),
+      command: Type.Optional(Type.String({ description: "SSH command for connect; optionally selects the endpoint for note or memory" })),
+      note: Type.Optional(Type.String({ description: "Endpoint note; omit or empty clears it" })),
+      cwd: Type.Optional(Type.String({ description: "Remote cwd for chdir, exec, or fanout" })),
+      forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT mappings" })),
+      remoteCommand: Type.Optional(Type.String({ description: "Shell command for exec or fanout" })),
+      timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_REMOTE_TIMEOUT_SECONDS, description: `Timeout seconds; default ${DEFAULT_REMOTE_TIMEOUT_SECONDS}` })),
+      displayLines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_DISPLAY_LINES, description: "Collapsed TUI lines only" })),
+      modelLines: Type.Optional(Type.Integer({ minimum: 1, maximum: DEFAULT_MAX_LINES, description: "Maximum model-facing output lines for this command" })),
+      modelBytes: Type.Optional(Type.Integer({ minimum: MIN_MODEL_OUTPUT_BYTES, maximum: DEFAULT_MAX_BYTES, description: "Maximum model-facing output bytes for this command" })),
+      sinceCursor: Type.Optional(Type.String({ description: "Cursor from a prior identical exec; return only new output" })),
+      env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Environment variables for exec or fanout" })),
+      group: Type.Optional(Type.String({ description: "Run command through sg GROUP" })),
+      background: Type.Optional(Type.Boolean({ description: "Launch exec with nohup; implied by session" })),
+      session: Type.Optional(Type.String({ description: "tmux session name for background exec" })),
+      log: Type.Optional(Type.String({ description: "Remote stdout/stderr log path for background exec" })),
+      artifactRef: Type.Optional(Type.String({ description: "Artifact reference returned by oversized exec/fanout" })),
+      offset: Type.Optional(Type.Integer({ minimum: 1, description: "First artifact line to read" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: DEFAULT_MAX_LINES, description: "Artifact lines to read" })),
+      jobId: Type.Optional(Type.String({ description: "Tracked background job id" })),
+      statusCommand: Type.Optional(Type.String({ description: "Optional command returning a JSON object of job metrics" })),
+      includeGpu: Type.Optional(Type.Boolean({ description: "Include compact nvidia-smi metrics in job_status" })),
+      endpoints: Type.Optional(Type.Array(Type.String(), { maxItems: 16, description: "Saved endpoint keys, SSH aliases, or ssh commands for fanout; defaults to all saved endpoints" })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       if (params.action === "status") {
@@ -1604,10 +1806,141 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           details: { endpoint: label, server: serverMemoryId(parsed), path, entries: memory?.entries ?? [] },
         };
       }
+      if (params.action === "artifact") {
+        if (!params.artifactRef) throw new Error("artifactRef is required for artifact");
+        const artifact = runtimeCache.artifacts.get(params.artifactRef);
+        if (!artifact || !existsSync(artifact)) throw new Error(`Unknown or expired output artifact: ${params.artifactRef}`);
+        const offset = params.offset ?? 1;
+        const limit = params.limit ?? params.modelLines ?? configuredOutputLimits().execMaxLines;
+        const result = await localRead.execute(
+          _id,
+          { path: artifact, offset, limit },
+          _signal,
+          _update,
+        );
+        const limited = limitRemoteToolResult(result, "read", offset, limit, params.modelBytes);
+        return {
+          ...limited,
+          details: { ...(limited.details ?? {}), action: "artifact", artifactRef: params.artifactRef, offset, limit },
+        };
+      }
+      if (params.action === "job_status") {
+        const state = await ensureConnected(ctx);
+        const candidates = [...runtimeCache.jobs.values()].filter((job) => job.endpoint === cacheId(state));
+        const job = params.jobId
+          ? runtimeCache.jobs.get(params.jobId)
+          : candidates.length === 1 ? candidates[0] : undefined;
+        if (!job) throw new Error(params.jobId ? `Unknown job: ${params.jobId}` : "jobId is required when zero or multiple jobs are tracked");
+        if (job.endpoint !== cacheId(state)) throw new Error(`Job ${job.id} belongs to another endpoint`);
+        const aliveCheck = job.session
+          ? `tmux has-session -t ${quote(`=${job.session}`)} 2>/dev/null`
+          : `kill -0 ${job.pid} 2>/dev/null`;
+        const shellStatus = await withReconnect((client) => execRemote(client,
+          `if ${aliveCheck}; then echo alive=1; else echo alive=0; fi; ` +
+          `if test -e ${quote(job.log)}; then echo log_exists=1; stat -c 'log_bytes=%s' ${quote(job.log)}; wc -l < ${quote(job.log)} | sed 's/^/log_lines=/'; else echo log_exists=0; fi`,
+          true,
+          params.timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS,
+        ));
+        const current: Record<string, unknown> = { startedAt: job.startedAt, session: job.session, pid: job.pid, log: job.log };
+        for (const line of shellStatus.toString("utf8").trim().split(/\r?\n/)) {
+          const match = line.match(/^([a-z_]+)=(.*)$/);
+          if (!match) continue;
+          const [, key, value] = match;
+          current[key!] = key === "alive" || key === "log_exists"
+            ? value === "1"
+            : Number.isFinite(Number(value)) ? Number(value) : value;
+        }
+        if (params.includeGpu) {
+          const gpu = await withReconnect((client) => execRemote(client,
+            "nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true",
+            true,
+            params.timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS,
+          ));
+          current.gpus = gpu.toString("utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => {
+            const [index, memoryMiB, utilizationPercent] = line.split(",").map((value) => Number(value.trim()));
+            return { index, memoryMiB, utilizationPercent };
+          });
+        }
+        if (params.statusCommand) {
+          const metrics = await withReconnect((client) => execRemoteLimited(
+            client,
+            `cd -- ${quote(job.cwd)} && ${params.statusCommand}`,
+            params.timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS,
+            50,
+            16 * 1024,
+          ));
+          if (metrics.truncation.truncated) throw new Error("statusCommand JSON exceeds 50 lines or 16KB");
+          const parsed = JSON.parse(metrics.content);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("statusCommand must return one JSON object");
+          current.metrics = parsed;
+        }
+        const changes = changedStatus(job.lastStatus, current);
+        job.lastStatus = current;
+        const payload = Object.keys(changes).length ? { jobId: job.id, changes } : { jobId: job.id, unchanged: true };
+        return { content: [{ type: "text", text: JSON.stringify(payload) }], details: { action: "job_status", ...payload, current } };
+      }
+      if (params.action === "fanout") {
+        if (!params.remoteCommand) throw new Error("remoteCommand is required for fanout");
+        if (params.background || params.session || params.log) throw new Error("fanout supports foreground commands only");
+        const config = loadRemoteConfig();
+        const selectors = params.endpoints?.length ? params.endpoints : Object.keys(config.endpoints ?? {});
+        if (!selectors.length) throw new Error("No saved endpoints are configured for fanout");
+        const timeoutSeconds = parseRemoteTimeout(params.timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
+        const limits = configuredOutputLimits();
+        const requestedLines = parseOutputLines(params.modelLines ?? Math.min(DEFAULT_FANOUT_LINES, limits.execMaxLines), "Model lines");
+        const requestedBytes = parseOutputBytes(params.modelBytes ?? Math.min(DEFAULT_FANOUT_BYTES, limits.execMaxBytes), "Model bytes");
+        const remaining = Math.max(MIN_MODEL_OUTPUT_BYTES, limits.turnMaxBytes - turnOutputBytes);
+        const perEndpointBytes = Math.max(MIN_MODEL_OUTPUT_BYTES, Math.min(requestedBytes, Math.floor(remaining / selectors.length) - 256));
+        const invocation = structuredRemoteCommand(params.remoteCommand, params.env, params.group);
+        for (const selector of selectors) {
+          try {
+            const selected = configuredEndpoint(selector);
+            if ((!remote || cacheId(remote) !== cacheId(selected.parsed)) && !loadKnownHosts()[`${selected.parsed.host}:${selected.parsed.port}`]) {
+              await trustHostInteractive(selected.parsed, ctx);
+            }
+          } catch {}
+        }
+        const results = await Promise.all(selectors.map(async (selector) => {
+          let temporary: RemoteState | undefined;
+          try {
+            const selected = configuredEndpoint(selector);
+            const active = remote && cacheId(remote) === cacheId(selected.parsed) ? remote : undefined;
+            const state = active ?? await establish(selected.parsed, await cachedAuthentication(selected.parsed), selected.cwd);
+            if (!active) temporary = state;
+            const cwd = executionCwd(state, params.cwd);
+            const formatted = await execRemoteLimited(
+              state.client,
+              `cd -- ${quote(cwd)} && ${invocation}`,
+              timeoutSeconds,
+              requestedLines,
+              perEndpointBytes,
+            );
+            const artifactRef = formatted.fullOutputPath ? registerArtifact(formatted.fullOutputPath) : undefined;
+            const output = formatted.truncation.truncated && params.modelLines === undefined && params.modelBytes === undefined
+              ? truncateTail(formatted.content, { maxLines: 4, maxBytes: 768 }).content
+              : formatted.content;
+            return {
+              endpoint: selected.parsed.label,
+              ok: true,
+              exitCode: formatted.exitCode,
+              output,
+              ...(artifactRef ? { artifactRef, totalLines: formatted.truncation.totalLines, totalBytes: formatted.truncation.totalBytes } : {}),
+            };
+          } catch (error) {
+            return { endpoint: selector, ok: false, error: (error as Error).message };
+          } finally {
+            temporary?.client.end();
+          }
+        }));
+        const text = JSON.stringify(results);
+        turnOutputBytes += Buffer.byteLength(text, "utf8");
+        return { content: [{ type: "text", text }], details: { action: "fanout", results } };
+      }
       if (params.action === "exec") {
         const state = await ensureConnected(ctx);
         if (!params.remoteCommand) throw new Error("remoteCommand is required for exec");
-        const cdTarget = params.cwd === undefined ? standaloneCdTarget(params.remoteCommand) : undefined;
+        const hasStructuredOptions = params.env !== undefined || params.group !== undefined || params.background || params.session || params.log;
+        const cdTarget = params.cwd === undefined && !hasStructuredOptions ? standaloneCdTarget(params.remoteCommand) : undefined;
         if (cdTarget !== undefined) {
           const resolved = await changeRemoteCwd(cdTarget, ctx);
           return { content: [{ type: "text", text: resolved }], details: { connected: true, cwd: resolved } };
@@ -1615,26 +1948,80 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const displayLines = parseDisplayLines(params.displayLines ?? configuredDisplayLines());
         const timeoutSeconds = parseRemoteTimeout(params.timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
         const limits = configuredOutputLimits();
+        const modelLines = parseOutputLines(params.modelLines ?? limits.execMaxLines, "Model lines");
+        const modelBytes = parseOutputBytes(params.modelBytes ?? limits.execMaxBytes, "Model bytes");
+        const cwd = executionCwd(state, params.cwd);
+        const invocation = structuredRemoteCommand(params.remoteCommand, params.env, params.group);
+        const session = validateSessionName(params.session);
+        if (params.log && !params.background && !session) throw new Error("log requires background=true or session");
+        if (params.background || session) {
+          const jobId = `job_${randomUUID().slice(0, 8)}`;
+          const suppliedLog = params.log || `/tmp/pi-ssh-remote-${jobId}.log`;
+          const log = suppliedLog.startsWith("/") ? posix.normalize(suppliedLog) : posix.resolve(cwd, suppliedLog);
+          const launch = session
+            ? `if tmux has-session -t ${quote(`=${session}`)} 2>/dev/null; then echo ${quote(`tmux session already exists: ${session}`)} >&2; exit 73; fi; tmux new-session -d -s ${quote(session)} ${quote(`${invocation} > ${quote(log)} 2>&1`)}`
+            : `nohup bash -lc ${quote(invocation)} > ${quote(log)} 2>&1 < /dev/null & echo pid=$!`;
+          const launched = await withReconnect((client) => execRemoteLimited(
+            client,
+            `cd -- ${quote(cwd)} && ${launch}`,
+            timeoutSeconds,
+            20,
+            DEFAULT_LONG_OUTPUT_SUMMARY_BYTES,
+          ));
+          const pidMatch = launched.content.match(/(?:^|\n)pid=(\d+)/);
+          const pid = pidMatch ? Number(pidMatch[1]) : undefined;
+          const job: RemoteJob = {
+            id: jobId,
+            endpoint: cacheId(state),
+            cwd,
+            log,
+            ...(pid ? { pid } : {}),
+            ...(session ? { session } : {}),
+            startedAt: new Date().toISOString(),
+          };
+          runtimeCache.jobs.set(jobId, job);
+          trimRuntimeMap(runtimeCache.jobs);
+          const text = `job_id=${jobId}${pid ? ` pid=${pid}` : ""}${session ? ` session=${session}` : ""} log=${log}`;
+          return { content: [{ type: "text", text }], details: { action: "exec", background: true, ...job, displayLines, output: text } };
+        }
         const formatted = await withReconnect((client) => execRemoteLimited(
           client,
-          `cd -- ${quote(params.cwd ?? state.cwd)} && ${params.remoteCommand}`,
+          `cd -- ${quote(cwd)} && ${invocation}`,
           timeoutSeconds,
-          limits.execMaxLines,
-          limits.execMaxBytes,
+          modelLines,
+          modelBytes,
         ));
+        const artifactRef = formatted.fullOutputPath ? registerArtifact(formatted.fullOutputPath) : undefined;
+        const tracked = updateOutputCursor(state, invocation, cwd, formatted.content, params.sinceCursor);
+        let text: string;
+        if (formatted.truncation.truncated && params.modelLines === undefined && params.modelBytes === undefined) {
+          const tail = truncateTail(tracked.output, {
+            maxLines: DEFAULT_LONG_OUTPUT_SUMMARY_LINES,
+            maxBytes: DEFAULT_LONG_OUTPUT_SUMMARY_BYTES,
+          }).content;
+          text = `exit_code=${formatted.exitCode} lines=${formatted.truncation.totalLines} bytes=${formatted.truncation.totalBytes}` +
+            `${artifactRef ? ` artifact_ref=${artifactRef}` : ""} cursor=${tracked.cursor}` +
+            `${tail ? `\ntail:\n${tail}` : ""}`;
+        } else {
+          text = `${tracked.output || "No new output."}\n[cursor=${tracked.cursor}${artifactRef ? ` artifact_ref=${artifactRef}` : ""}]`;
+        }
         return limitRemoteToolResult({
-          content: [{ type: "text", text: formatted.text }],
+          content: [{ type: "text", text }],
           details: {
             action: "exec",
             connected: true,
-            cwd: state.cwd,
+            cwd,
             displayLines,
-            output: formatted.content,
+            modelLines,
+            modelBytes,
+            output: text,
+            cursor: tracked.cursor,
+            artifactRef,
             modelLimited: true,
             truncation: formatted.truncation.truncated ? formatted.truncation : undefined,
             fullOutputPath: formatted.fullOutputPath,
           },
-        }, "exec");
+        }, "exec", 1, modelLines, modelBytes);
       }
       const command = params.command || lastCommand || activeSshCommand();
       if (!command) throw new Error(`No SSH endpoint configured. Set ${REMOTE_CONFIG_FILE} or pass command.`);
