@@ -1908,6 +1908,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         };
       }
       if (params.action === "job_status") {
+        const limits = configuredOutputLimits();
+        if (limits.turnMaxBytes - turnOutputBytes < MIN_MODEL_OUTPUT_BYTES) {
+          return limitRemoteToolResult({ content: [{ type: "text", text: "" }], details: { action: "job_status", skipped: true } }, "exec");
+        }
         const state = await ensureConnected(ctx);
         const candidates = [...runtimeCache.jobs.values()].filter((job) => job.endpoint === cacheId(state));
         const job = params.jobId
@@ -1961,7 +1965,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const changes = changedStatus(job.lastStatus, current);
         job.lastStatus = current;
         const payload = Object.keys(changes).length ? { jobId: job.id, changes } : { jobId: job.id, unchanged: true };
-        return { content: [{ type: "text", text: JSON.stringify(payload) }], details: { action: "job_status", ...payload, current } };
+        return limitRemoteToolResult({
+          content: [{ type: "text", text: JSON.stringify(payload) }],
+          details: { action: "job_status", ...payload, current },
+        }, "exec", 1, params.modelLines, params.modelBytes);
       }
       if (params.action === "fanout") {
         if (!params.remoteCommand) throw new Error("remoteCommand is required for fanout");
@@ -1971,10 +1978,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         if (!selectors.length) throw new Error("No saved endpoints are configured for fanout");
         const timeoutSeconds = parseRemoteTimeout(params.timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
         const limits = configuredOutputLimits();
+        if (limits.turnMaxBytes - turnOutputBytes < MIN_MODEL_OUTPUT_BYTES) {
+          return limitRemoteToolResult({ content: [{ type: "text", text: "" }], details: { action: "fanout", skipped: true } }, "exec");
+        }
         const requestedLines = parseOutputLines(params.modelLines ?? Math.min(DEFAULT_FANOUT_LINES, limits.execMaxLines), "Model lines");
         const requestedBytes = parseOutputBytes(params.modelBytes ?? Math.min(DEFAULT_FANOUT_BYTES, limits.execMaxBytes), "Model bytes");
-        const remaining = Math.max(MIN_MODEL_OUTPUT_BYTES, limits.turnMaxBytes - turnOutputBytes);
-        const perEndpointBytes = Math.max(MIN_MODEL_OUTPUT_BYTES, Math.min(requestedBytes, Math.floor(remaining / selectors.length) - 256));
+        const perEndpointLines = Math.max(1, Math.floor(requestedLines / selectors.length));
+        const perEndpointBytes = Math.max(MIN_MODEL_OUTPUT_BYTES, Math.floor(requestedBytes / selectors.length));
         const invocation = structuredRemoteCommand(params.remoteCommand, params.env, params.group);
         for (const selector of selectors) {
           try {
@@ -1996,7 +2006,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
               state.client,
               `cd -- ${quote(cwd)} && ${invocation}`,
               timeoutSeconds,
-              requestedLines,
+              perEndpointLines,
               perEndpointBytes,
             );
             const artifactRef = formatted.fullOutputPath ? registerArtifact(formatted.fullOutputPath) : undefined;
@@ -2017,8 +2027,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           }
         }));
         const text = JSON.stringify(results);
-        turnOutputBytes += Buffer.byteLength(text, "utf8");
-        return { content: [{ type: "text", text }], details: { action: "fanout", results } };
+        return limitRemoteToolResult({
+          content: [{ type: "text", text }],
+          details: { action: "fanout", results },
+        }, "exec", 1, requestedLines, requestedBytes);
       }
       if (params.action === "exec") {
         const state = await ensureConnected(ctx);
