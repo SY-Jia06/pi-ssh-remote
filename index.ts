@@ -9,7 +9,7 @@
 import ssh2, { type Client as SshClient, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import { Duplex } from "node:stream";
@@ -89,6 +89,8 @@ interface RuntimeCache {
   cursors: Map<string, OutputCursor>;
   artifacts: Map<string, string>;
   jobs: Map<string, RemoteJob>;
+  outputDir?: string;
+  outputCleanupRegistered?: boolean;
 }
 
 interface RemoteEndpointConfig {
@@ -178,6 +180,10 @@ const runtimeCache = cacheHost[RUNTIME_CACHE_KEY] ??= {
   artifacts: new Map<string, string>(),
   jobs: new Map<string, RemoteJob>(),
 };
+if (!runtimeCache.outputCleanupRegistered) {
+  runtimeCache.outputCleanupRegistered = true;
+  process.once("exit", () => cleanupRuntimeOutputs());
+}
 
 function shellWords(input: string): string[] {
   const words: string[] = [];
@@ -665,10 +671,29 @@ function displayFingerprint(hex: string): string {
   return `SHA256:${Buffer.from(hex, "hex").toString("base64").replace(/=+$/, "")}`;
 }
 
+function runtimeOutputDir(): string {
+  if (runtimeCache.outputDir && existsSync(runtimeCache.outputDir)) return runtimeCache.outputDir;
+  runtimeCache.outputDir = mkdtempSync(join(tmpdir(), "pi-ssh-remote-output-"));
+  chmodSync(runtimeCache.outputDir, 0o700);
+  return runtimeCache.outputDir;
+}
+
+function deleteOutput(path: string): void {
+  try { rmSync(path, { force: true }); } catch {}
+}
+
+function cleanupRuntimeOutputs(): void {
+  for (const path of runtimeCache.artifacts.values()) deleteOutput(path);
+  runtimeCache.artifacts.clear();
+  if (runtimeCache.outputDir) {
+    try { rmSync(runtimeCache.outputDir, { recursive: true, force: true }); } catch {}
+    runtimeCache.outputDir = undefined;
+  }
+}
+
 function createOutputFile(): { path: string; fd: number } {
-  const outputDir = mkdtempSync(join(tmpdir(), "pi-ssh-remote-output-"));
-  const path = join(outputDir, "output.log");
-  return { path, fd: openSync(path, "w", 0o600) };
+  const path = join(runtimeOutputDir(), `${randomUUID()}.log`);
+  return { path, fd: openSync(path, "wx", 0o600) };
 }
 
 function saveOutput(output: string): string {
@@ -685,7 +710,12 @@ function trimRuntimeMap<T>(values: Map<string, T>): void {
 function registerArtifact(path: string): string {
   const ref = `out_${randomUUID().slice(0, 8)}`;
   runtimeCache.artifacts.set(ref, path);
-  trimRuntimeMap(runtimeCache.artifacts);
+  while (runtimeCache.artifacts.size > MAX_RUNTIME_ENTRIES) {
+    const oldest = runtimeCache.artifacts.entries().next().value as [string, string] | undefined;
+    if (!oldest) break;
+    runtimeCache.artifacts.delete(oldest[0]);
+    deleteOutput(oldest[1]);
+  }
   return ref;
 }
 
@@ -822,6 +852,12 @@ class RemoteExecAccumulator {
     const file = this.outputFile;
     this.outputFile = undefined;
     closeSync(file.fd);
+  }
+
+  discard(): void {
+    const path = this.outputFile?.path;
+    this.close();
+    if (path) deleteOutput(path);
   }
 }
 
@@ -1080,7 +1116,7 @@ function execRemoteLimited(
         if (settled) return;
         settled = true;
         cleanup();
-        accumulator.close();
+        accumulator.discard();
         reject(failure);
       };
       stream.on("data", (chunk: Buffer) => accumulator.append(chunk));
@@ -1959,6 +1995,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             50,
             16 * 1024,
           ));
+          if (metrics.fullOutputPath) deleteOutput(metrics.fullOutputPath);
           if (metrics.exitCode !== 0) throw new Error(`statusCommand exited with code ${metrics.exitCode}: ${metrics.content}`);
           if (metrics.truncation.truncated) throw new Error("statusCommand JSON exceeds 50 lines or 16KB");
           const parsed = JSON.parse(metrics.content);
@@ -2067,6 +2104,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             20,
             DEFAULT_LONG_OUTPUT_SUMMARY_BYTES,
           ));
+          if (launched.fullOutputPath) deleteOutput(launched.fullOutputPath);
           if (launched.exitCode !== 0) throw new Error(`Background launch exited with code ${launched.exitCode}: ${launched.content}`);
           const pidMatch = launched.content.match(/(?:^|\n)pid=(\d+)/);
           const pid = pidMatch ? Number(pidMatch[1]) : undefined;
