@@ -1179,8 +1179,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     command: string,
     cwd: string,
     output: string,
+    truncated: boolean,
     sinceCursor?: string,
-  ): { cursor: string; output: string } => {
+  ): { cursor?: string; output: string; discontinuity?: boolean } => {
     const endpoint = cacheId(state);
     if (sinceCursor) {
       const previous = runtimeCache.cursors.get(sinceCursor);
@@ -1188,11 +1189,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (previous.endpoint !== endpoint || previous.command !== command || previous.cwd !== cwd) {
         throw new Error("Output cursor belongs to a different endpoint, command, or working directory");
       }
-      const delta = outputDelta(previous.output, output);
       runtimeCache.cursors.delete(sinceCursor);
+      if (truncated) return { output, discontinuity: true };
+      const delta = outputDelta(previous.output, output);
       runtimeCache.cursors.set(sinceCursor, { endpoint, command, cwd, output });
       return { cursor: sinceCursor, output: delta };
     }
+    if (truncated) return { output };
     const cursor = `cur_${randomUUID().slice(0, 8)}`;
     runtimeCache.cursors.set(cursor, { endpoint, command, cwd, output });
     trimRuntimeMap(runtimeCache.cursors);
@@ -2089,7 +2092,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           modelBytes,
         ));
         const artifactRef = formatted.fullOutputPath ? registerArtifact(formatted.fullOutputPath) : undefined;
-        const tracked = updateOutputCursor(state, invocation, cwd, formatted.content, params.sinceCursor);
+        const tracked = updateOutputCursor(state, invocation, cwd, formatted.content, formatted.truncation.truncated, params.sinceCursor);
         let text: string;
         if (formatted.truncation.truncated && params.modelLines === undefined && params.modelBytes === undefined) {
           const tail = truncateTail(tracked.output, {
@@ -2097,10 +2100,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             maxBytes: DEFAULT_LONG_OUTPUT_SUMMARY_BYTES,
           }).content;
           text = `exit_code=${formatted.exitCode} lines=${formatted.truncation.totalLines} bytes=${formatted.truncation.totalBytes}` +
-            `${artifactRef ? ` artifact_ref=${artifactRef}` : ""} cursor=${tracked.cursor}` +
+            `${artifactRef ? ` artifact_ref=${artifactRef}` : ""}` +
+            `${tracked.discontinuity ? " cursor_discontinuity=true" : ""}` +
             `${tail ? `\ntail:\n${tail}` : ""}`;
         } else {
-          text = `${tracked.output || "No new output."}\n[exit_code=${formatted.exitCode} cursor=${tracked.cursor}${artifactRef ? ` artifact_ref=${artifactRef}` : ""}]`;
+          const cursor = tracked.cursor ? ` cursor=${tracked.cursor}` : "";
+          const discontinuity = tracked.discontinuity ? " cursor_discontinuity=true" : "";
+          text = `${tracked.output || "No new output."}\n[exit_code=${formatted.exitCode}${cursor}${discontinuity}${artifactRef ? ` artifact_ref=${artifactRef}` : ""}]`;
         }
         return limitRemoteToolResult({
           content: [{ type: "text", text }],
@@ -2114,6 +2120,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             output: text,
             exitCode: formatted.exitCode,
             cursor: tracked.cursor,
+            cursorDiscontinuity: tracked.discontinuity,
             artifactRef,
             modelLimited: true,
             truncation: formatted.truncation.truncated ? formatted.truncation : undefined,

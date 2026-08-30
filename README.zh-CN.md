@@ -62,7 +62,7 @@ H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 
 ### 对 Agent 上下文更友好
 
-远程命令默认 30 秒超时。文本读取按范围获取，命令输出使用有界缓冲，同一轮远端工具共享 32 KB 输出预算。超限输出只返回短尾部和 `artifactRef`；重复轮询可传 cursor，只返回新增内容。
+远程命令默认 30 秒超时。文本读取按范围获取，命令输出使用有界缓冲，同一轮远端工具共享 32 KB 输出预算。超限输出只返回短尾部和 `artifactRef`；未截断时重复轮询可传 cursor，只返回新增内容。若轮询结果发生截断，插件会注销 cursor 并明确返回 `cursor_discontinuity`，不会静默漏掉中间输出。
 
 ### 可以远端跑服务、本地改代码
 
@@ -275,7 +275,7 @@ Agent 可直接传 `env`、`group`、`background`、`session`、`log`，无需�
 `remote` 工具还支持：
 
 - `modelLines`、`modelBytes`：单次模型输出上限；
-- `sinceCursor`：相同命令重复轮询时仅返回新增内容；
+- `sinceCursor`：未截断时安全返回相同命令的新增内容；发生截断时明确报告不连续；
 - 结构化 `env`、`group`、`background`、`session`、`log`；
 - `artifact`：按范围读取超限输出返回的 `artifactRef`；
 - `job_status`：检查后台任务，并可附带 GPU 与自定义 JSON 指标；

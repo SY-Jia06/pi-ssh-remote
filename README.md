@@ -35,7 +35,7 @@ Each `user@host:port` endpoint remembers its remote working directory, note, and
 
 ### Resilient and bounded by default
 
-Dropped connections are automatically re-established during the active session. SSH workspace state is also session-aware: `/new` inherits the current workspace, forks and clones retain their source workspace, and `/resume` restores the selected session's recorded endpoint, remote directory, routing mode, and forwards. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges, command output uses bounded buffers, and a 32 KB per-turn budget protects model context. Oversized output returns a short tail plus an `artifactRef`; repeated polls can use a cursor to return only new output.
+Dropped connections are automatically re-established during the active session. SSH workspace state is also session-aware: `/new` inherits the current workspace, forks and clones retain their source workspace, and `/resume` restores the selected session's recorded endpoint, remote directory, routing mode, and forwards. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges, command output uses bounded buffers, and a 32 KB per-turn budget protects model context. Oversized output returns a short tail plus an `artifactRef`; repeated polls can use a cursor while output remains within the retained window. If a poll truncates, the cursor is retired and the result reports `cursor_discontinuity` instead of silently skipping unseen output.
 
 ### Hybrid local/remote workflows
 
@@ -221,7 +221,7 @@ tools on the local repository.
 The `remote` tool also supports:
 
 - `modelLines` and `modelBytes` for per-call model-output limits;
-- `sinceCursor` for incremental repeats of the same command;
+- `sinceCursor` for safe incremental repeats while output remains untruncated, with explicit discontinuity reporting otherwise;
 - structured `env`, `group`, `background`, `session`, and `log` fields;
 - `artifact` to read a bounded range from an oversized command's `artifactRef`;
 - `job_status` for tracked background jobs, optional GPU metrics, and optional JSON metrics;

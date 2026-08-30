@@ -24,6 +24,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 - Failed endpoint switches now preserve the working SSH workspace; successful cross-endpoint switches close stale tunnels, and disconnect/session changes can no longer be undone by a late automatic reconnect.
 - Foreground remote execution now preserves both stdout and stderr, including diagnostics from non-zero exits, and reports the actual exit code instead of discarding useful output.
 - `fanout` and `job_status` now share the aggregate per-turn output budget with other remote tools; fanout limits apply to the whole result rather than multiplying per endpoint.
+- Incremental cursors are now retired with an explicit discontinuity marker whenever command output is truncated, preventing silent gaps between log polls.
 
 ## [0.1.12] - 2026-08-25
 
