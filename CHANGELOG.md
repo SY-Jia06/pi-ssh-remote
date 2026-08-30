@@ -26,6 +26,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 - `fanout` and `job_status` now share the aggregate per-turn output budget with other remote tools; fanout limits apply to the whole result rather than multiplying per endpoint.
 - Incremental cursors are now retired with an explicit discontinuity marker whenever command output is truncated, preventing silent gaps between log polls.
 - Remote output artifacts now use one private runtime directory and are deleted on eviction, failed execution, and process exit instead of leaking temporary directories.
+- OpenSSH config lookup and ProxyJump setup now have bounded connection behavior, reject interactive jump-host key prompts, and respect stream backpressure.
 
 ## [0.1.12] - 2026-08-25
 

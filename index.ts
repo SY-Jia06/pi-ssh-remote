@@ -219,7 +219,12 @@ function resolveOpenSshConfig(target: string, loginUser: string | undefined, por
   if (identityFile) args.push("-i", identityFile);
   args.push(target);
   try {
-    const output = execFileSync("ssh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) as string;
+    const output = execFileSync("ssh", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+    }) as string;
     const result: OpenSshConfig = { identityFiles: [] };
     for (const line of output.split(/\r?\n/)) {
       const match = line.match(/^(\S+)\s+(.*)$/);
@@ -936,14 +941,21 @@ function createSshProxy(config: ParsedSsh): SshProxy | undefined {
   // OpenSSH owns the jump-host authentication and ProxyJump chain. ssh2 then
   // speaks the final SSH protocol over the resulting raw socket.
   const destination = jumps.at(-1)!;
-  const args = ["-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-W", `${config.host}:${config.port}`];
+  const args = [
+    "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=yes",
+    "-o", "ConnectTimeout=10",
+    "-o", "ConnectionAttempts=1",
+    "-o", "ExitOnForwardFailure=yes",
+    "-W", `${config.host}:${config.port}`,
+  ];
   if (jumps.length > 1) args.push("-J", jumps.slice(0, -1).join(","));
   args.push(destination);
   const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
   let stderr = "";
   let closed = false;
   const socket = new Duplex({
-    read() {},
+    read() { child.stdout.resume(); },
     write(chunk, _encoding, callback) {
       if (child.stdin.destroyed) {
         callback(new Error("SSH ProxyJump stdin is closed"));
@@ -955,7 +967,9 @@ function createSshProxy(config: ParsedSsh): SshProxy | undefined {
   const proxyError = (error: Error) => {
     if (!socket.destroyed) socket.destroy(error);
   };
-  child.stdout.on("data", (chunk: Buffer) => socket.push(chunk));
+  child.stdout.on("data", (chunk: Buffer) => {
+    if (!socket.push(chunk)) child.stdout.pause();
+  });
   child.stderr.on("data", (chunk: Buffer) => {
     stderr = (stderr + chunk.toString()).slice(-4096);
   });

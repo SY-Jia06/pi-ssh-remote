@@ -256,7 +256,7 @@ Host build-server
 /remote ssh build-server
 ```
 
-Jump-host authentication uses the local OpenSSH configuration, SSH agent, or keys. To avoid an uncontrolled password prompt inside the Pi TUI, ProxyJump hosts must authenticate non-interactively; the target host's password or encrypted private-key passphrase is still prompted by the extension when needed. The command parser still accepts only `-p`, `-l`, and `-i` directly; other SSH options are not passed through.
+Jump-host authentication uses the local OpenSSH configuration, SSH agent, or keys. To avoid an uncontrolled prompt inside the Pi TUI, every ProxyJump host must already exist in local OpenSSH `known_hosts` and authenticate non-interactively; unknown or changed jump-host keys are rejected. The target host's password or encrypted private-key passphrase is still prompted by the extension when needed. The command parser still accepts only `-p`, `-l`, and `-i` directly; other SSH options are not passed through.
 
 ## Releases
 
