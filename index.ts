@@ -36,6 +36,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
 import { sshRouteId } from "./route-identity.js";
+import { authenticationSteps, createAuthHandler, isRecoverableAuthenticationError, parseOpenSshConfigOutput, resolveIdentityAgent, shouldInvalidateCachedPassword, shouldPromptForPassword } from "./ssh-auth.js";
 
 const { Client, utils: ssh2Utils } = ssh2;
 
@@ -43,7 +44,10 @@ interface ParsedSsh {
   host: string;
   port: number;
   username: string;
-  identityFile?: string;
+  identityFiles: string[];
+  identitiesOnly: boolean;
+  identityAgent?: string;
+  explicitIdentityFile?: string;
   /** Original OpenSSH target, such as pimei01-jia or user@host. */
   sshTarget: string;
   /** Effective ProxyJump value from the local OpenSSH configuration. */
@@ -160,6 +164,7 @@ const DEFAULT_TURN_MAX_BYTES = 32 * 1024;
 const MIN_MODEL_OUTPUT_BYTES = 1024;
 const OUTPUT_FOOTER_RESERVE_BYTES = 512;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
+const SSH_CONNECT_TIMEOUT_MS = 12000;
 const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
 const MAX_PRIVATE_KEY_BYTES = 1024 * 1024;
 const MAX_RUNTIME_ENTRIES = 128;
@@ -210,6 +215,7 @@ interface OpenSshConfig {
   user?: string;
   identityFiles: string[];
   identitiesOnly?: boolean;
+  identityAgent?: string;
   proxyJump?: string;
 }
 
@@ -226,19 +232,7 @@ function resolveOpenSshConfig(target: string, loginUser: string | undefined, por
       timeout: 5000,
       maxBuffer: 1024 * 1024,
     }) as string;
-    const result: OpenSshConfig = { identityFiles: [] };
-    for (const line of output.split(/\r?\n/)) {
-      const match = line.match(/^(\S+)\s+(.*)$/);
-      if (!match) continue;
-      const [, key, value] = match;
-      if (key === "hostname") result.hostname = value;
-      else if (key === "port") result.port = Number(value);
-      else if (key === "user") result.user = value;
-      else if (key === "identityfile" && value !== "none") result.identityFiles.push(value);
-      else if (key === "identitiesonly") result.identitiesOnly = value === "yes";
-      else if (key === "proxyjump" && value !== "none") result.proxyJump = value;
-    }
-    return result;
+    return parseOpenSshConfigOutput(output) as OpenSshConfig;
   } catch {
     // Keep literal host behavior if OpenSSH is unavailable or rejects -G.
     return undefined;
@@ -288,10 +282,9 @@ function parseSshCommand(command: string): ParsedSsh {
     Boolean(sshConfig.proxyJump) ||
     sshConfig.hostname !== requestedHost ||
     sshConfig.port !== undefined && sshConfig.port !== 22 ||
-    sshConfig.user !== undefined && sshConfig.user !== username ||
-    sshConfig.identitiesOnly === true
+    sshConfig.user !== undefined && sshConfig.user !== username
   ));
-  const configuredIdentity = !identityFile && usesOpenSshAlias ? sshConfig?.identityFiles[0] : undefined;
+  const identityFiles = [...new Set(identityFile ? [identityFile] : (sshConfig?.identityFiles ?? []))];
   const effectiveHost = sshConfig?.hostname || requestedHost;
   const effectivePort = sshConfig?.port || port;
   const effectiveUser = sshConfig?.user || username;
@@ -301,7 +294,10 @@ function parseSshCommand(command: string): ParsedSsh {
     host: effectiveHost,
     port: effectivePort,
     username: effectiveUser,
-    ...(identityFile || configuredIdentity ? { identityFile: identityFile || configuredIdentity } : {}),
+    identityFiles,
+    identitiesOnly: sshConfig?.identitiesOnly ?? false,
+    ...(sshConfig?.identityAgent ? { identityAgent: sshConfig.identityAgent } : {}),
+    ...(identityFile ? { explicitIdentityFile: identityFile } : {}),
     sshTarget: target,
     ...(proxyJump ? { proxyJump } : {}),
     label: usesOpenSshAlias ? target : `${effectiveUser}@${effectiveHost}:${effectivePort}`,
@@ -333,34 +329,35 @@ function deleteCachedPassword(config: ParsedSsh): void {
   credentialCache.passwords.delete(cacheId(config));
 }
 
-function resolveIdentityPath(config: ParsedSsh): string {
-  if (!config.identityFile) throw new Error("No SSH identity file is configured");
-  if (config.identityFile === "~" || config.identityFile.startsWith("~/")) {
+function resolveIdentityPath(identityFile: string): string {
+  if (identityFile === "~" || identityFile.startsWith("~/")) {
     const home = process.env.HOME;
     if (!home) throw new Error("Cannot expand SSH identity path because HOME is not set");
-    return config.identityFile === "~" ? home : join(home, config.identityFile.slice(2));
+    return identityFile === "~" ? home : join(home, identityFile.slice(2));
   }
-  return config.identityFile;
+  return identityFile;
 }
 
-function keyPassphraseId(config: ParsedSsh): string {
-  return `${cacheId(config)}|${resolveIdentityPath(config)}`;
+function keyPassphraseId(config: ParsedSsh, identityFile: string): string {
+  return `${cacheId(config)}|${resolveIdentityPath(identityFile)}`;
 }
 
-function getCachedKeyPassphrase(config: ParsedSsh): string | undefined {
-  return credentialCache.keyPassphrases.get(keyPassphraseId(config));
+function getCachedKeyPassphrase(config: ParsedSsh, identityFile: string): string | undefined {
+  return credentialCache.keyPassphrases.get(keyPassphraseId(config, identityFile));
 }
 
-function setCachedKeyPassphrase(config: ParsedSsh, passphrase: string): void {
-  credentialCache.keyPassphrases.set(keyPassphraseId(config), passphrase);
+function setCachedKeyPassphrase(config: ParsedSsh, identityFile: string, passphrase: string): void {
+  credentialCache.keyPassphrases.set(keyPassphraseId(config, identityFile), passphrase);
 }
 
-function deleteCachedKeyPassphrase(config: ParsedSsh): void {
-  if (config.identityFile) credentialCache.keyPassphrases.delete(keyPassphraseId(config));
+function deleteCachedKeyPassphrase(config: ParsedSsh, identityFile?: string): void {
+  for (const file of identityFile ? [identityFile] : config.identityFiles) {
+    credentialCache.keyPassphrases.delete(keyPassphraseId(config, file));
+  }
 }
 
-function readPrivateKey(config: ParsedSsh): Buffer {
-  const path = resolveIdentityPath(config);
+function readPrivateKey(identityFile: string): Buffer {
+  const path = resolveIdentityPath(identityFile);
   let stat;
   try { stat = statSync(path); }
   catch (error) { throw new Error(`Cannot access SSH private key ${path}: ${(error as Error).message}`); }
@@ -1082,33 +1079,101 @@ async function trustHostInteractive(config: ParsedSsh, ctx: any): Promise<void> 
   }
 }
 
-type SshAuthentication = Partial<Pick<ConnectConfig, "password" | "privateKey" | "passphrase" | "agent">>;
+type SshAuthAttempt =
+  | { type: "none"; username: string }
+  | { type: "publickey"; username: string; key: Buffer; passphrase?: string }
+  | { type: "agent"; username: string; agent: string }
+  | { type: "password"; username: string; password: string };
+
+interface SshAuthentication {
+  authHandler: (methodsLeft: string[] | null, partialSuccess: boolean | null, callback: (attempt: SshAuthAttempt | false) => void) => void;
+  preparationError: () => Error | undefined;
+  passwordAvailable: () => boolean;
+  passwordRejected: () => boolean;
+  setPromptStateListener: (listener?: (active: boolean) => void) => void;
+}
+
+type SshConnectionError = Error & { level?: string; passwordAuthenticationFailed?: boolean };
 
 function connect(config: ParsedSsh, authentication: SshAuthentication, fingerprint: string): Promise<SshClient> {
   const proxy = createSshProxy(config);
-  return new Promise((resolve, reject) => {
+  return new Promise<SshClient>((resolve, reject) => {
     const client = new Client();
+    let settled = false;
+    let remainingMs = SSH_CONNECT_TIMEOUT_MS;
+    let timerStartedAt = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const pauseTimer = () => {
+      if (!timer) return;
+      remainingMs = Math.max(0, remainingMs - (Date.now() - timerStartedAt));
+      clearTimeout(timer);
+      timer = undefined;
+    };
+    const cleanup = () => {
+      pauseTimer();
+      authentication.setPromptStateListener();
+    };
+    const fail = (error: SshConnectionError) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const resumeTimer = () => {
+      if (settled || timer) return;
+      timerStartedAt = Date.now();
+      timer = setTimeout(() => {
+        timer = undefined;
+        remainingMs = 0;
+        const error = new Error("Timed out while waiting for SSH handshake") as SshConnectionError;
+        error.level = "client-timeout";
+        fail(error);
+        client.end();
+      }, Math.max(1, remainingMs));
+    };
+
+    authentication.setPromptStateListener((active) => active ? pauseTimer() : resumeTimer());
     const options: ConnectConfig = {
       ...(proxy ? { sock: proxy.socket } : { host: config.host, port: config.port }),
       username: config.username,
-      ...authentication,
-      readyTimeout: 12000,
+      authHandler: authentication.authHandler,
+      readyTimeout: 0,
       keepaliveInterval: 15000,
       keepaliveCountMax: 3,
       hostHash: "sha256",
       hostVerifier: (hash) => hash === fingerprint,
     };
-    client.once("ready", () => resolve(client));
-    client.once("close", () => proxy?.close());
-    // ssh2 may emit a socket error followed by a protocol error while a
-    // connection is lost during handshake. Keep consuming client errors after
-    // the first one so EventEmitter does not turn the follow-up into an
-    // uncaught exception; rejecting an already-settled promise is a no-op.
-    client.on("error", reject);
-    client.connect(options);
-  }).catch((error) => {
+    client.once("ready", () => {
+      if (settled) return client.end();
+      settled = true;
+      cleanup();
+      resolve(client);
+    });
+    client.once("close", () => {
+      proxy?.close();
+      fail(new Error("SSH connection closed before authentication completed"));
+    });
+    // ssh2 reports Agent and key-signing errors before continuing its own
+    // authentication state machine. Keep the listener permanent, but reject
+    // only terminal failures.
+    client.on("error", (error: SshConnectionError) => {
+      if (!isRecoverableAuthenticationError(error)) fail(error);
+    });
+    resumeTimer();
+    try { client.connect(options); }
+    catch (error) { fail(error as SshConnectionError); }
+  }).catch((error: SshConnectionError) => {
     proxy?.close();
-    throw error;
+    const terminalAuthFailure = /all configured authentication methods failed/i.test(error.message);
+    let failure = error;
+    const preparationError = authentication.preparationError();
+    if (preparationError && terminalAuthFailure) {
+      failure = new Error(`${preparationError.message}; all configured authentication methods failed`) as SshConnectionError;
+      failure.level = error.level;
+    }
+    if (shouldInvalidateCachedPassword(error, authentication.passwordRejected())) failure.passwordAuthenticationFailed = true;
+    throw failure;
   });
 }
 
@@ -1309,37 +1374,84 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return matches[0]!;
   };
 
-  const standardAuthentication = (password?: string): SshAuthentication => ({
-    ...(password ? { password } : {}),
-    ...(process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
-  });
+  const authentication = (parsed: ParsedSsh, password?: string, ctx?: any): SshAuthentication => {
+    const steps = authenticationSteps({
+      identityFiles: parsed.identityFiles,
+      identitiesOnly: parsed.identitiesOnly,
+      agent: resolveIdentityAgent(parsed.identityAgent, process.env.SSH_AUTH_SOCK),
+      password,
+    });
+    let preparationError: Error | undefined;
+    let passwordOffered = false;
+    let passwordAttempted = false;
+    let passwordAccepted = false;
+    let promptStateListener: (active: boolean) => void = () => {};
 
-  const privateKeyAuthentication = async (parsed: ParsedSsh, ctx?: any): Promise<SshAuthentication> => {
-    const keyData = readPrivateKey(parsed);
-    let passphrase = getCachedKeyPassphrase(parsed);
-    let privateKey = parsePrivateKey(keyData, passphrase);
-    if (privateKey instanceof Error && isPassphraseError(privateKey)) {
-      if (passphrase) deleteCachedKeyPassphrase(parsed);
-      if (!ctx) throw new Error(`SSH private key ${resolveIdentityPath(parsed)} requires its passphrase again; reconnect interactively`);
-      passphrase = await askSecret(ctx, `Passphrase for ${parsed.identityFile}`, "private key passphrase") ?? undefined;
-      if (!passphrase) throw new Error("No SSH private key passphrase was provided");
-      privateKey = parsePrivateKey(keyData, passphrase);
-      if (privateKey instanceof Error) {
-        deleteCachedKeyPassphrase(parsed);
-        throw new Error(`Could not unlock SSH private key ${resolveIdentityPath(parsed)}: ${privateKey.message}`);
+    const prepareIdentity = async (identityFile: string): Promise<{ key: Buffer; passphrase?: string } | undefined> => {
+      const explicit = identityFile === parsed.explicitIdentityFile;
+      let keyData: Buffer;
+      try { keyData = readPrivateKey(identityFile); }
+      catch (error) {
+        if (explicit) preparationError ??= error as Error;
+        return undefined;
       }
-      setCachedKeyPassphrase(parsed, passphrase);
-    }
-    if (privateKey instanceof Error) {
-      throw new Error(`Invalid SSH private key ${resolveIdentityPath(parsed)}: ${privateKey.message}`);
-    }
-    return { privateKey: keyData, ...(passphrase ? { passphrase } : {}) };
+      let passphrase = getCachedKeyPassphrase(parsed, identityFile);
+      let privateKey = parsePrivateKey(keyData, passphrase);
+      if (privateKey instanceof Error && isPassphraseError(privateKey)) {
+        if (passphrase) {
+          deleteCachedKeyPassphrase(parsed, identityFile);
+          passphrase = undefined;
+        }
+        if (!ctx) {
+          preparationError ??= new Error(`SSH private key ${resolveIdentityPath(identityFile)} requires its passphrase; reconnect interactively`);
+          return undefined;
+        }
+        promptStateListener(true);
+        try {
+          passphrase = await askSecret(ctx, `Passphrase for ${identityFile}`, "private key passphrase") ?? undefined;
+        } finally {
+          promptStateListener(false);
+        }
+        if (!passphrase) {
+          preparationError ??= new Error(`No passphrase was provided for SSH private key ${resolveIdentityPath(identityFile)}`);
+          return undefined;
+        }
+        privateKey = parsePrivateKey(keyData, passphrase);
+        if (privateKey instanceof Error) {
+          deleteCachedKeyPassphrase(parsed, identityFile);
+          preparationError ??= new Error(`Could not unlock SSH private key ${resolveIdentityPath(identityFile)}: ${privateKey.message}`);
+          return undefined;
+        }
+        setCachedKeyPassphrase(parsed, identityFile, passphrase);
+      }
+      if (privateKey instanceof Error) {
+        if (explicit) preparationError ??= new Error(`Invalid SSH private key ${resolveIdentityPath(identityFile)}: ${privateKey.message}`);
+        return undefined;
+      }
+      return { key: keyData, ...(passphrase ? { passphrase } : {}) };
+    };
+
+    const authHandler = createAuthHandler({
+      steps,
+      username: parsed.username,
+      prepareIdentity,
+      onMethodsLeft: (methodsLeft: string[] | null) => { if (methodsLeft?.includes("password")) passwordOffered = true; },
+      onAttempt: (attempt: SshAuthAttempt) => { if (attempt.type === "password") passwordAttempted = true; },
+      onAccepted: (attempt: SshAuthAttempt) => { if (attempt.type === "password") passwordAccepted = true; },
+      onError: (error: unknown) => { preparationError ??= error as Error; },
+    }) as SshAuthentication["authHandler"];
+
+    return {
+      authHandler,
+      preparationError: () => preparationError,
+      passwordAvailable: () => passwordOffered,
+      passwordRejected: () => passwordAttempted && !passwordAccepted,
+      setPromptStateListener: (listener) => { promptStateListener = listener ?? (() => {}); },
+    };
   };
 
-  const cachedAuthentication = (parsed: ParsedSsh): Promise<SshAuthentication> =>
-    parsed.identityFile
-      ? privateKeyAuthentication(parsed)
-      : Promise.resolve(standardAuthentication(getCachedPassword(parsed)));
+  const cachedAuthentication = (parsed: ParsedSsh): SshAuthentication =>
+    authentication(parsed, getCachedPassword(parsed));
 
   const mapPath = (path: string): string => {
     if (!remote) return path;
@@ -1504,11 +1616,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     const parsed = parseSshCommand(source.command);
     const password = getCachedPassword(parsed);
     const pending = (async () => {
-      const authentication = parsed.identityFile
-        ? await privateKeyAuthentication(parsed)
-        : standardAuthentication(password);
       const oldClient = remote?.client;
-      const next = await establish(parsed, authentication, source.cwd);
+      const next = await establish(parsed, authentication(parsed, password), source.cwd);
       if (generation !== connectionGeneration) {
         next.client.end();
         throw new Error("SSH reconnection was superseded by another workspace action");
@@ -1589,18 +1698,16 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     let password = getCachedPassword(parsed);
     ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `connecting ${endpointDisplayLabel(parsed)}…`));
     try {
-      let authentication = parsed.identityFile
-        ? await privateKeyAuthentication(parsed, ctx)
-        : standardAuthentication(password);
       let next: RemoteState;
+      const initialAuthentication = authentication(parsed, password, ctx);
       try {
-        next = await establish(parsed, authentication, cwd ?? configuredCwd(command));
+        next = await establish(parsed, initialAuthentication, cwd ?? configuredCwd(command));
       } catch (error) {
-        if (parsed.identityFile || !/authentication methods failed|authentication failure/i.test((error as Error).message)) throw error;
+        if (!shouldPromptForPassword(error, initialAuthentication.passwordAvailable())) throw error;
+        if ((error as SshConnectionError).passwordAuthenticationFailed) deleteCachedPassword(parsed);
         password = await askPassword(ctx) ?? undefined;
-        if (!password) throw new Error("No SSH password was provided and SSH agent authentication failed");
-        authentication = standardAuthentication(password);
-        next = await establish(parsed, authentication, cwd ?? configuredCwd(command));
+        if (!password) throw new Error("No SSH password was provided after key and Agent authentication failed");
+        next = await establish(parsed, authentication(parsed, password, ctx), cwd ?? configuredCwd(command));
       }
       if (generation !== connectionGeneration) {
         next.client.end();
@@ -1614,7 +1721,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       remote = next;
       routeRemoteTools = true;
       previous?.client.end();
-      if (!parsed.identityFile && password) setCachedPassword(parsed, password);
+      if (password) setCachedPassword(parsed, password);
       credentialCache.resume = {
         command,
         cwd: next.cwd,
@@ -1630,7 +1737,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return next;
     } catch (error) {
       if (generation === connectionGeneration) {
-        if (!parsed.identityFile) deleteCachedPassword(parsed);
+        if ((error as SshConnectionError).passwordAuthenticationFailed) deleteCachedPassword(parsed);
         remote = previous;
         routeRemoteTools = previous ? previousRouting : false;
         lastConnectionError = (error as Error).message;
@@ -2094,7 +2201,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           try {
             const selected = configuredEndpoint(selector);
             const active = remote && cacheId(remote) === cacheId(selected.parsed) ? remote : undefined;
-            const state = active ?? await establish(selected.parsed, await cachedAuthentication(selected.parsed), selected.cwd);
+            const state = active ?? await establish(selected.parsed, cachedAuthentication(selected.parsed), selected.cwd);
             if (!active) temporary = state;
             const cwd = executionCwd(state, params.cwd);
             const formatted = await execRemoteLimited(

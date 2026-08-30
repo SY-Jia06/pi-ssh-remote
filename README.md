@@ -241,7 +241,7 @@ New or changed target-host keys require interactive confirmation for that SSH ro
 
 ## OpenSSH configuration and ProxyJump
 
-The extension resolves `~/.ssh/config` through the local `ssh -G` command, so SSH aliases, `HostName`, `User`, `Port`, `IdentityFile`, and `ProxyJump` can be used directly. The final SSH session is still established by the extension's `ssh2` client; ProxyJump is carried by a local OpenSSH `ssh -W` stream.
+The extension resolves `~/.ssh/config` through the local `ssh -G` command, so SSH aliases, `HostName`, `User`, `Port`, `IdentityFile`, `IdentityAgent`, `IdentitiesOnly`, and `ProxyJump` can be used directly. Configured identity files are tried in order, including file-key/password multi-factor sequences requested by the server (`ssh2` does not expose Agent-backed partial-success transitions reliably). `IdentityAgent none` disables the process Agent; a custom socket or `$ENV_VAR` overrides it. With `IdentitiesOnly no`, the SSH Agent follows configured files; with `IdentitiesOnly yes`, unrestricted Agent fallback is disabled (Agent-only private halves for configured public keys are not yet supported). Password authentication remains available, missing default key files are skipped, and encrypted keys request their passphrase only when reached. The final SSH session is still established by the extension's `ssh2` client; ProxyJump is carried by a local OpenSSH `ssh -W` stream.
 
 For example, an alias such as this can be used directly:
 

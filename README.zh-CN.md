@@ -320,7 +320,7 @@ Agent 可直接传 `env`、`group`、`background`、`session`、`log`，无需�
 
 ## SSH 配置与 ProxyJump
 
-插件会通过本机的 `ssh -G` 解析 `~/.ssh/config`，因此可以直接使用 SSH 别名、`HostName`、`User`、`Port`、`IdentityFile` 和 `ProxyJump`。最终的 SSH 会话仍由插件的 `ssh2` 建立；ProxyJump 链路由本机 OpenSSH 以 `ssh -W` 方式承载。
+插件会通过本机的 `ssh -G` 解析 `~/.ssh/config`，因此可以直接使用 SSH 别名、`HostName`、`User`、`Port`、`IdentityFile`、`IdentityAgent`、`IdentitiesOnly` 和 `ProxyJump`。配置的私钥会依次尝试，并支持服务端要求的文件私钥/密码多因素认证顺序（`ssh2` 无法可靠暴露 Agent 的 partial-success 阶段切换）。`IdentityAgent none` 会禁用进程 Agent，自定义 socket 或 `$ENV_VAR` 会覆盖它；`IdentitiesOnly no` 时随后尝试 Agent，`IdentitiesOnly yes` 时禁用不受限的 Agent 回退（暂不支持由 Agent 提供已配置公钥对应私钥的模式）。密码认证仍可使用，不存在的默认密钥会跳过，加密密钥只在轮到时询问 passphrase。最终的 SSH 会话仍由插件的 `ssh2` 建立；ProxyJump 链路由本机 OpenSSH 以 `ssh -W` 方式承载。
 
 例如，下面这样的别名可以直接使用：
 

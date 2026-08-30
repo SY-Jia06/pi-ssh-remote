@@ -28,6 +28,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 - Remote output artifacts now use one private runtime directory and are deleted on eviction, failed execution, and process exit instead of leaking temporary directories.
 - OpenSSH config lookup and ProxyJump setup now have bounded connection behavior, reject interactive jump-host key prompts, and respect stream backpressure.
 - SSH aliases and ProxyJump chains that reach the same effective address now keep separate endpoint state, credentials, host-key trust, jobs, cursors, and server memory, with lazy migration of legacy records.
+- OpenSSH authentication now preserves ordered `IdentityFile` values, respects `IdentityAgent` and unrestricted-Agent `IdentitiesOnly` behavior, supports server-directed file-key/password multi-factor phases, skips absent defaults, pauses the handshake timeout only during an actual passphrase prompt, avoids unsupported password prompts, and retains cached passwords across non-authentication failures.
 
 ## [0.1.12] - 2026-08-25
 
