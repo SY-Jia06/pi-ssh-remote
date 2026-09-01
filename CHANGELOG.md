@@ -8,15 +8,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Added
 
-- None.
+- Added local OpenSSH configuration resolution via `ssh -G`, including SSH aliases and ProxyJump support through an `ssh -W` stream.
+- Added per-call `modelLines`/`modelBytes`, incremental output cursors, and bounded artifact reads.
+- Added structured background launches with environment, Unix group, tmux session, and log fields plus change-only `job_status` checks.
+- Added compact concurrent `fanout` execution across saved endpoints.
 
 ### Changed
 
-- None.
+- Oversized command output now defaults to a compact tail summary and `artifactRef` instead of sending the full configured tail to the model.
 
 ### Fixed
 
-- None.
+- Remote tool blocks now show the requested action, execution context, and shell command instead of displaying only `remote` above the output.
+- Port-forward startup now rejects conflicting reuse of a local port, rolls back partial multi-forward failures, and closes active tunnel sockets without hanging shutdown.
+- Failed endpoint switches now preserve the working SSH workspace; successful cross-endpoint switches close stale tunnels, and disconnect/session changes can no longer be undone by a late automatic reconnect.
+- Foreground remote execution now preserves both stdout and stderr, including diagnostics from non-zero exits, and reports the actual exit code instead of discarding useful output.
+- `fanout` and `job_status` now share the aggregate per-turn output budget with other remote tools; fanout limits apply to the whole result rather than multiplying per endpoint.
+- Incremental cursors are now retired with an explicit discontinuity marker whenever command output is truncated, preventing silent gaps between log polls.
+- Remote output artifacts now use one private runtime directory and are deleted on eviction, failed execution, and process exit instead of leaking temporary directories.
+- OpenSSH config lookup and ProxyJump setup now have bounded connection behavior, reject interactive jump-host key prompts, and respect stream backpressure.
+- SSH aliases and ProxyJump chains that reach the same effective address now keep separate endpoint state, credentials, host-key trust, jobs, cursors, and server memory, with lazy migration of legacy records.
+- OpenSSH authentication now preserves ordered `IdentityFile` values, respects `IdentityAgent` and unrestricted-Agent `IdentitiesOnly` behavior, supports server-directed file-key/password multi-factor phases, skips absent defaults, pauses the handshake timeout only during an actual passphrase prompt, avoids unsupported password prompts, and retains cached passwords across non-authentication failures.
 
 ## [0.1.12] - 2026-08-25
 

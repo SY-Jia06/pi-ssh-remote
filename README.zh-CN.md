@@ -62,7 +62,7 @@ H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 
 ### 对 Agent 上下文更友好
 
-远程命令默认 30 秒超时，避免某个前台任务长期占住 Agent。远程文本读取会按范围获取，不再先下载完整文件；命令输出通过有界缓冲流式处理；同一轮远端工具共享 32 KB 输出预算，避免并行调用迅速占满上下文。超限命令的完整输出会保存到权限受限的临时文件，方便后续按需检查。
+远程命令默认 30 秒超时。文本读取按范围获取，命令输出使用有界缓冲，同一轮远端工具共享 32 KB 输出预算。超限输出只返回短尾部和 `artifactRef`；未截断时重复轮询可传 cursor，只返回新增内容。若轮询结果发生截断，插件会注销 cursor 并明确返回 `cursor_discontinuity`，不会静默漏掉中间输出。
 
 ### 可以远端跑服务、本地改代码
 
@@ -92,7 +92,7 @@ H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 pi install npm:pi-ssh-remote
 ```
 
-本地要求 Node.js 20+。远程服务器需要提供 Bash、SFTP 和 GNU `timeout`。
+本地要求 Node.js 20+。使用 SSH 别名或 ProxyJump 时，还需要本机的 OpenSSH 客户端。远程服务器需要提供 Bash、SFTP 和 GNU `timeout`；使用结构化 `session` 启动还需要 tmux。
 
 ## 快速开始
 
@@ -177,7 +177,7 @@ pi install npm:pi-ssh-remote
 把 PID、输出目录和日志路径发给我，再检查一次进程是否仍在运行、日志是否已经开始写入。
 ```
 
-插件默认限制前台命令的执行时间，但通过 `nohup` 等方式启动的后台任务可以继续在服务器运行。
+Agent 可直接传 `env`、`group`、`background`、`session`、`log`，无需拼多层引号。启动后返回 `jobId`；`job_status` 只报告变化的状态。
 
 ### 3. 管理多台服务器
 
@@ -270,6 +270,17 @@ pi install npm:pi-ssh-remote
 | `/remote off` | 断开连接并返回本地 |
 | `/remote forget` | 断开连接并清除内存中的密码和密钥 passphrase |
 
+### Agent 工具新增能力
+
+`remote` 工具还支持：
+
+- `modelLines`、`modelBytes`：单次模型输出上限；
+- `sinceCursor`：未截断时安全返回相同命令的新增内容；发生截断时明确报告不连续；
+- 结构化 `env`、`group`、`background`、`session`、`log`；
+- `artifact`：按范围读取超限输出返回的 `artifactRef`；
+- `job_status`：检查后台任务，并可附带 GPU 与自定义 JSON 指标；
+- `fanout`：在最多 16 个已保存 endpoint 上并行执行同一前台命令，返回紧凑 JSON。
+
 ## 配置保存在哪里
 
 服务器配置保存在本地：
@@ -289,26 +300,42 @@ pi install npm:pi-ssh-remote
 - 命令预览设置；
 - 模型输出预算。
 
-此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。
+每条解析后的 SSH 路由（原始 target、ProxyJump 链以及最终 user／host／port）分别保存 endpoint 状态、凭据、目标主机信任、job、cursor 和服务器记忆；旧 endpoint 与记忆记录会在使用时迁移为路由专属记录。此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。
 
 私钥内容、密码和密钥 passphrase 都不会写入配置文件。插件仅在连接时从本地读取私钥；手动输入的密码和 passphrase 只会缓存在当前 Pi 进程的内存中。
 
 ## 安全与输出限制
 
-- 第一次连接新服务器时，需要确认主机密钥；
-- 主机密钥发生变化时，会再次要求确认；
+- 第一次连接新的 SSH 路由时，需要确认目标主机密钥；
+- 该路由的目标主机密钥发生变化时，会再次要求确认；
 - 远程命令默认 30 秒超时；
 - 远程文本读取默认最多返回 400 行或 16 KB，并支持通过 `offset`/`limit` 继续读取；
-- 远程命令默认最多返回最后 200 行或 8 KB；
+- 远程命令默认使用 200 行／8 KB 模型输出预算；
+- 超限时模型只收到最后 8 行／2 KB 摘要和 `artifactRef`；
 - 同一轮所有远端工具默认共享 32 KB 模型输出预算；
 - 文本范围读取不会先通过 SFTP 下载完整远程文件；
-- 超限命令会流式写入权限受限的本地临时文件，不在内存中累积完整输出；
-- 各项限制可以配置，但不能超过扩展的硬安全上限；
-- 折叠显示行数最大为 50，只影响界面，不会增加模型输出。
+- 超限命令的完整 stdout／stderr 合并流会写入权限受限的本地 artifact；
+- `displayLines` 只影响界面，`modelLines`／`modelBytes` 控制模型输出；
+- cursor、artifact 引用和 job ID 在当前 Pi 进程内有效。
 
-## 当前限制
+## SSH 配置与 ProxyJump
 
-目前只支持 SSH 直连，以及 `-p`、`-l`、`-i` 参数。暂不读取 `~/.ssh/config` 或 ProxyJump；如需指定私钥，请显式使用 `-i`，不要依赖 SSH config 中的 `IdentityFile`。
+插件会通过本机的 `ssh -G` 解析 `~/.ssh/config`，因此可以直接使用 SSH 别名、`HostName`、`User`、`Port`、`IdentityFile`、`IdentityAgent`、`IdentitiesOnly` 和 `ProxyJump`。配置的私钥会依次尝试，并支持服务端要求的文件私钥/密码多因素认证顺序（`ssh2` 无法可靠暴露 Agent 的 partial-success 阶段切换）。`IdentityAgent none` 会禁用进程 Agent，自定义 socket 或 `$ENV_VAR` 会覆盖它；`IdentitiesOnly no` 时随后尝试 Agent，`IdentitiesOnly yes` 时禁用不受限的 Agent 回退（暂不支持由 Agent 提供已配置公钥对应私钥的模式）。密码认证仍可使用，不存在的默认密钥会跳过，加密密钥只在轮到时询问 passphrase。最终的 SSH 会话仍由插件的 `ssh2` 建立；ProxyJump 链路由本机 OpenSSH 以 `ssh -W` 方式承载。
+
+例如，下面这样的别名可以直接使用：
+
+```sshconfig
+Host build-server
+    HostName build.example.com
+    User alice
+    ProxyJump bastion
+```
+
+```text
+/remote ssh build-server
+```
+
+跳板机认证使用本机 OpenSSH 的配置、SSH Agent 或密钥。为避免在 Pi TUI 中出现不可控提示，每台 ProxyJump 跳板机都必须已存在于本机 OpenSSH `known_hosts` 且能够非交互式认证；未知或发生变化的跳板机密钥会被拒绝。目标服务器的密码或加密私钥 passphrase 仍由插件在 Pi 中询问。当前仍只接受 `-p`、`-l` 和 `-i` 作为命令行参数，不支持把任意其他 SSH 选项直接传给插件。
 
 ## 版本发布
 

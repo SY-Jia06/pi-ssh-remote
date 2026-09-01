@@ -35,7 +35,7 @@ Each `user@host:port` endpoint remembers its remote working directory, note, and
 
 ### Resilient and bounded by default
 
-Dropped connections are automatically re-established during the active session. SSH workspace state is also session-aware: `/new` inherits the current workspace, forks and clones retain their source workspace, and `/resume` restores the selected session's recorded endpoint, remote directory, routing mode, and forwards. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges instead of downloading complete files, command output is streamed through bounded buffers, and a 32 KB per-turn budget prevents parallel tools from flooding model context. Complete oversized command output is preserved in a permission-restricted temporary file.
+Dropped connections are automatically re-established during the active session. SSH workspace state is also session-aware: `/new` inherits the current workspace, forks and clones retain their source workspace, and `/resume` restores the selected session's recorded endpoint, remote directory, routing mode, and forwards. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges, command output uses bounded buffers, and a 32 KB per-turn budget protects model context. Oversized output returns a short tail plus an `artifactRef`; repeated polls can use a cursor while output remains within the retained window. If a poll truncates, the cursor is retired and the result reports `cursor_discontinuity` instead of silently skipping unseen output.
 
 ### Hybrid local/remote workflows
 
@@ -58,7 +58,7 @@ Tunnel mode forwards remote services to localhost while returning Pi's tools to 
 pi install npm:pi-ssh-remote
 ```
 
-Requires Node.js 20+. The remote server must provide Bash, SFTP, and GNU `timeout`.
+Requires Node.js 20+. Using SSH aliases or ProxyJump also requires the local OpenSSH client. The remote server must provide Bash, SFTP, and GNU `timeout`; structured `session` launches additionally require tmux.
 
 ## Quick start
 
@@ -135,7 +135,7 @@ and report the PID, output directory, and log path. Verify that the process is
 still alive and that the log has started.
 ```
 
-The default foreground timeout prevents an accidental long-running command from occupying the agent indefinitely, while an explicitly backgrounded job continues on the server.
+The agent can pass `env`, `group`, `background`, `session`, and `log` as structured fields, avoiding nested shell quoting. The returned `jobId` can be polled with `job_status`, which reports only changed state.
 
 ### 3. Keep several machines understandable
 
@@ -216,6 +216,17 @@ tools on the local repository.
 | `/remote off` | Disconnect and return tools to local execution |
 | `/remote forget` | Disconnect and clear cached passwords and key passphrases |
 
+### Agent tool additions
+
+The `remote` tool also supports:
+
+- `modelLines` and `modelBytes` for per-call model-output limits;
+- `sinceCursor` for safe incremental repeats while output remains untruncated, with explicit discontinuity reporting otherwise;
+- structured `env`, `group`, `background`, `session`, and `log` fields;
+- `artifact` to read a bounded range from an oversized command's `artifactRef`;
+- `job_status` for tracked background jobs, optional GPU metrics, and optional JSON metrics;
+- `fanout` to run one foreground command concurrently across up to 16 saved endpoints and return compact JSON.
+
 ## Persistence, output, and security
 
 Endpoint configuration is stored locally in:
@@ -224,13 +235,28 @@ Endpoint configuration is stored locally in:
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-Saved global values include endpoints, active endpoint, notes, remote working directories, forwards, identity file paths, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Private key contents, passwords, and key passphrases are **never written to this file**. Private keys are read locally only when connecting; prompted passwords and passphrases remain only in process memory.
+Saved global values include endpoints, active endpoint, notes, remote working directories, forwards, identity file paths, preview settings, and model-output budgets. Each resolved SSH route—original target and ProxyJump chain plus effective user, host, and port—has independent endpoint state, credentials, target-host trust, jobs, cursors, and server memory. Legacy endpoint and memory records are migrated to route-specific records when used. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Private key contents, passwords, and key passphrases are **never written to this file**. Private keys are read locally only when connecting; prompted passwords and passphrases remain only in process memory.
 
-New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
+New or changed target-host keys require interactive confirmation for that SSH route and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote commands use a 200-line/8-KB model budget, and all remote tools in one turn share 32 KB. Oversized commands show only an 8-line/2-KB tail summary and store complete combined stdout/stderr in a permission-restricted local artifact. Read it through `artifactRef`; local paths are not required. `displayLines` affects only collapsed UI, while `modelLines`/`modelBytes` control model-facing output. Cursors, artifact references, and tracked job IDs live for the current Pi process.
 
-## Current SSH scope
+## OpenSSH configuration and ProxyJump
 
-The extension currently supports direct SSH commands with `-p`, `-l`, and `-i`. It does not yet consume `~/.ssh/config` or ProxyJump settings; use `-i` explicitly instead of relying on an `IdentityFile` entry.
+The extension resolves `~/.ssh/config` through the local `ssh -G` command, so SSH aliases, `HostName`, `User`, `Port`, `IdentityFile`, `IdentityAgent`, `IdentitiesOnly`, and `ProxyJump` can be used directly. Configured identity files are tried in order, including file-key/password multi-factor sequences requested by the server (`ssh2` does not expose Agent-backed partial-success transitions reliably). `IdentityAgent none` disables the process Agent; a custom socket or `$ENV_VAR` overrides it. With `IdentitiesOnly no`, the SSH Agent follows configured files; with `IdentitiesOnly yes`, unrestricted Agent fallback is disabled (Agent-only private halves for configured public keys are not yet supported). Password authentication remains available, missing default key files are skipped, and encrypted keys request their passphrase only when reached. The final SSH session is still established by the extension's `ssh2` client; ProxyJump is carried by a local OpenSSH `ssh -W` stream.
+
+For example, an alias such as this can be used directly:
+
+```sshconfig
+Host build-server
+    HostName build.example.com
+    User alice
+    ProxyJump bastion
+```
+
+```text
+/remote ssh build-server
+```
+
+Jump-host authentication uses the local OpenSSH configuration, SSH agent, or keys. To avoid an uncontrolled prompt inside the Pi TUI, every ProxyJump host must already exist in local OpenSSH `known_hosts` and authenticate non-interactively; unknown or changed jump-host keys are rejected. The target host's password or encrypted private-key passphrase is still prompted by the extension when needed. The command parser still accepts only `-p`, `-l`, and `-i` directly; other SSH options are not passed through.
 
 ## Releases
 
