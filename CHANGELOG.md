@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Added
 
+- Added a native OpenCode adapter with session-scoped SSH state, stable custom tools, permission integration, system-prompt routing, OpenSSH ControlMaster transport, and one-time import of existing Pi endpoints.
+- Added explicit OpenCode `remote_apply_patch(patchText)` support for adding, updating, deleting, and moving remote files; the built-in `apply_patch` remains local.
 - Added local OpenSSH configuration resolution via `ssh -G`, including SSH aliases and ProxyJump support through an `ssh -W` stream.
 - Added per-call `modelLines`/`modelBytes`, incremental output cursors, and bounded artifact reads.
 - Added structured background launches with environment, Unix group, tmux session, and log fields plus change-only `job_status` checks.
@@ -15,10 +17,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Changed
 
+- OpenCode patch parsing and edit matching now reuse official OpenCode logic with pinned upstream provenance for native-compatible semantics; `remote_write` remains a whole-file write tool, and Pi retains its native `createWriteTool`/`createEditTool` operations.
+- OpenCode remote file tools now require remote `python3` and use ephemeral Python standard-library code over OpenSSH, without a remote server/helper installation. Writes use same-directory staging, per-file atomic rename, and stale-snapshot checks; multi-file patches are not transactional or crash-proof all-or-nothing operations.
+- OpenCode `remote_read` now performs bounded text-range reads through the remote filesystem backend and returns native-style output with continuation guidance.
 - Oversized command output now defaults to a compact tail summary and `artifactRef` instead of sending the full configured tail to the model.
 
 ### Fixed
 
+- OpenCode file uploads now preserve SSH rejection diagnostics instead of emitting uncaught stdin pipe errors.
 - Remote tool blocks now show the requested action, execution context, and shell command instead of displaying only `remote` above the output.
 - Port-forward startup now rejects conflicting reuse of a local port, rolls back partial multi-forward failures, and closes active tunnel sockets without hanging shutdown.
 - Failed endpoint switches now preserve the working SSH workspace; successful cross-endpoint switches close stale tunnels, and disconnect/session changes can no longer be undone by a late automatic reconnect.

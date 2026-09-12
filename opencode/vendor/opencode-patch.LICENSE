@@ -1,0 +1,87 @@
+OpenCode patch engine provenance
+===============================
+
+Upstream repository (linked from https://opencode.ai):
+https://github.com/anomalyco/opencode
+Release: https://github.com/anomalyco/opencode/releases/tag/v1.18.30
+Tag: refs/tags/v1.18.30
+Resolved tag commit: 3104c1428ec91f809e5ab86631300de41eb6952e
+Verified using https://api.github.com/repos/anomalyco/opencode/git/ref/tags/v1.18.30
+Retrieved: 2026-09-12
+
+Vendored source (entire pure module, except its first-line self-reexport;
+an attribution comment was added):
+https://raw.githubusercontent.com/anomalyco/opencode/3104c1428ec91f809e5ab86631300de41eb6952e/packages/core/src/patch.ts
+Git blob SHA-1: a4370d44aac12180cb76b0b4df05afcd05c71e8e
+No parser, matcher, BOM, or newline logic was changed.
+
+Upstream license:
+https://raw.githubusercontent.com/anomalyco/opencode/3104c1428ec91f809e5ab86631300de41eb6952e/LICENSE
+Git blob SHA-1: 6439474beed8e0271df9862eff97ffd70ec2464c
+
+Upstream regression cases adapted in ../spec/patch.spec.ts:
+https://github.com/anomalyco/opencode/blob/3104c1428ec91f809e5ab86631300de41eb6952e/packages/core/test/patch.test.ts
+https://github.com/anomalyco/opencode/blob/3104c1428ec91f809e5ab86631300de41eb6952e/packages/opencode/test/patch/patch.test.ts
+
+Compatibility scope
+-------------------
+This is the official pure core (v2) engine present in release 1.18.30.
+The release also contains packages/opencode/src/patch/index.ts (legacy v1).
+These are NOT identical: the legacy parser silently skips malformed lines
+and its EOF-marker branch is unreachable. The core parser validates bodies
+and supports EOF markers. The core matcher also appends pure additions after
+an existing final blank line, where the legacy matcher inserts before it.
+This vendor deliberately uses the core implementation
+without recreating the legacy bugs, and does not claim byte-for-byte legacy
+CLI behavior. @opencode-ai/core is private:true at this commit; the installed
+@opencode-ai/plugin@1.18.29 exposes no injectable patch parser/matcher API.
+
+The adapter ../patch.ts adds read-only, versioned filesystem planning, input
+limits, and a sequential in-memory overlay. It uses the native apply_patch
+tool's add-file final-newline rule: empty stays empty, otherwise append LF
+only if content does not already end with LF. derive/joinBom are used exactly
+as upstream for updates. In particular, there is no CRLF normalization: CRs
+in unchanged file lines and patch content remain, and updates may produce
+mixed endings just as upstream does. Upstream EOF matching prefers the end
+at each matching tolerance, then falls back to forward search. Upstream
+permits surrounding text/heredocs around the first Begin/End envelope.
+
+Move overwrite behavior was verified in the same release's legacy tool:
+https://github.com/anomalyco/opencode/blob/3104c1428ec91f809e5ab86631300de41eb6952e/packages/opencode/src/tool/apply_patch.ts
+Its move branch writes the destination with writeWithDirs, then removes
+the source; it does not reject an existing destination. Adds also overwrite.
+The core tool currently rejects moves, although its pure parser supports
+them. The remote planner implements the verified legacy move/overwrite
+behavior with both source and destination initial snapshot versions, and
+rejects self-moves after resolution to avoid deleting the result. Repeated
+paths compose in patch order (not as simultaneous renames). File/descendant
+target combinations are rejected. Absent-to-absent net changes are omitted.
+Callers must verify ALL returned versions before writing any changes.
+
+Planner limits: 10 MiB UTF-8 patch text, 10 MiB total initial snapshot content,
+10 MiB total overlay content, 50,000 lines per input/output text, and 1,024
+distinct resolved paths. Line limits also bound the upstream spread/splice
+argument count without changing its implementation. These are adapter
+resource limits, not additions to the official patch language.
+
+MIT License
+
+Copyright (c) 2025 opencode
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
