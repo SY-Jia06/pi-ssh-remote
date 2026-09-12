@@ -94,6 +94,39 @@ pi install npm:pi-ssh-remote
 
 本地要求 Node.js 20+。使用 SSH 别名或 ProxyJump 时，还需要本机的 OpenSSH 客户端。远程服务器需要提供 Bash、SFTP 和 GNU `timeout`；使用结构化 `session` 启动还需要 tmux。
 
+### OpenCode 适配器
+
+源码中的 [`opencode/`](opencode/) 提供原生 OpenCode 适配器。它使用 OpenCode 稳定的插件、自定义工具、权限、system hook 和 session API，不依赖实验性的 remote-workspace 协议，也不会在远端安装 OpenCode server 或辅助 stub。
+
+在 `~/.config/opencode/opencode.json` 注册本地 package：
+
+```json
+{
+  "plugin": ["/absolute/path/to/pi-ssh-remote/opencode"],
+  "permission": { "remote": "ask" }
+}
+```
+
+首次使用时，适配器会在可用时导入 `~/.pi/agent/ssh-remote-config.json` 中不含凭据的 endpoint 配置，之后把 OpenCode 状态保存在 `~/.config/opencode/ssh-remote-config.json`。远程状态按 OpenCode session ID 隔离并恢复。适配器提供 `remote`、`remote_read`、`remote_write`、`remote_edit`、`remote_apply_patch`、`remote_grep`、`remote_glob` 和 `remote_bash`；session 激活后，system hook 会让模型使用这些远端工具，而 OpenCode 内置工具仍保持本地语义。尤其是当前内置的 `apply_patch` 仍修改本地文件；远程补丁请显式使用 `remote_apply_patch` 工具。
+
+OpenCode 远程文件工具要求**远端主机提供 Python 3（`python3`）**。文件系统后端通过 OpenSSH 临时执行仅依赖 Python 标准库的代码，无需在远端安装服务器或辅助程序。
+
+- `remote_apply_patch(patchText)` 支持 `*** Add File`、`*** Update File`、`*** Delete File`，以及更新块内的 `*** Move to`。
+- `remote_edit` 将 `oldString` 替换为 `newString`，可选 `replaceAll`。补丁解析和编辑匹配复用 OpenCode 官方逻辑，并固定、记录上游来源，提供原生兼容（native-compatible）语义。
+- `remote_write` 通过 `filePath` 和 `content` 创建或覆盖整个 UTF-8 文本文件。文件变更限制为每个文件 10 MiB；补丁规划还限制总内容大小和行数，详见[固定版本补丁引擎说明](opencode/vendor/opencode-patch.LICENSE)。
+- `remote_read` 使用从 1 开始的 `offset` 和行数上限 `limit` 在远端按范围有界读取文本，返回原生风格的路径、类型、内容、行号及续读提示，无需先下载整个文本文件。
+
+写入采用同目录暂存和单文件原子重命名，并在变更前检查文件快照是否已过期。多文件补丁不具备事务原子性；失败或崩溃时可能已有部分变更生效。Pi 的远程写入和编辑继续使用原生 `createWriteTool`/`createEditTool` operations。
+
+连接并选定远程工作目录后的工具调用示例：
+
+```text
+remote_apply_patch({"patchText":"*** Begin Patch\n*** Add File: hello-remote.txt\n+Hello from the remote workspace.\n*** End Patch"})
+remote_read({"filePath":"hello-remote.txt","offset":1,"limit":20})
+```
+
+适配器通过非交互式 OpenSSH ControlMaster 复用连接，原生支持 alias、ProxyJump、`known_hosts` 和 ssh-agent。它不会在 OpenCode 内截获密码输入；加密私钥需要先加入 ssh-agent。
+
 ## 快速开始
 
 连接服务器：

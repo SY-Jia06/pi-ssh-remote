@@ -60,6 +60,39 @@ pi install npm:pi-ssh-remote
 
 Requires Node.js 20+. Using SSH aliases or ProxyJump also requires the local OpenSSH client. The remote server must provide Bash, SFTP, and GNU `timeout`; structured `session` launches additionally require tmux.
 
+### OpenCode adapter
+
+This source tree also contains a native OpenCode adapter in [`opencode/`](opencode/). It uses OpenCode's plugin, custom-tool, permission, system-hook, and session APIs rather than the experimental remote-workspace protocol, so no OpenCode server or helper stub is installed remotely.
+
+Register the local package in `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": ["/absolute/path/to/pi-ssh-remote/opencode"],
+  "permission": { "remote": "ask" }
+}
+```
+
+On first use it imports non-secret endpoint settings from `~/.pi/agent/ssh-remote-config.json` when available, then stores OpenCode state in `~/.config/opencode/ssh-remote-config.json`. Active remote state is scoped and restored by OpenCode session ID. The adapter provides `remote`, `remote_read`, `remote_write`, `remote_edit`, `remote_apply_patch`, `remote_grep`, `remote_glob`, and `remote_bash`; an active-session system hook keeps the model on those remote tools while built-in OpenCode tools remain local. In particular, the current built-in `apply_patch` edits local files; use the explicit `remote_apply_patch` tool for remote patches.
+
+OpenCode remote file tools require **Python 3 (`python3`) on the remote host**. The filesystem backend runs ephemeral Python standard-library code over OpenSSH; no remote server or helper installation is needed.
+
+- `remote_apply_patch(patchText)` supports `*** Add File`, `*** Update File`, `*** Delete File`, and `*** Move to` within an update.
+- `remote_edit` replaces `oldString` with `newString`, with optional `replaceAll`. Patch parsing and edit matching reuse official OpenCode logic with pinned upstream provenance for native-compatible semantics.
+- `remote_write` creates or overwrites a whole UTF-8 text file using `filePath` and `content`. File mutations are limited to 10 MiB per file; patch planning additionally limits aggregate content and line counts, as documented with the [pinned patch engine](opencode/vendor/opencode-patch.LICENSE).
+- `remote_read` fetches bounded text ranges on the remote host using a 1-based `offset` and a line-count `limit`, returning native-style path/type/content output, line numbers, and continuation guidance without downloading the whole text file first.
+
+Writes use same-directory staging and atomic rename for individual file replacements, with stale-snapshot checks before mutation. Multi-file patches are not transactional, and failures or crashes can leave some changes applied. Pi continues to use its native `createWriteTool`/`createEditTool` operations for routed writes and edits.
+
+Example tool calls after connecting and selecting a remote working directory:
+
+```text
+remote_apply_patch({"patchText":"*** Begin Patch\n*** Add File: hello-remote.txt\n+Hello from the remote workspace.\n*** End Patch"})
+remote_read({"filePath":"hello-remote.txt","offset":1,"limit":20})
+```
+
+The adapter uses non-interactive OpenSSH with ControlMaster, so aliases, ProxyJump, `known_hosts`, and ssh-agent work natively. Password prompts are intentionally not captured inside OpenCode; add encrypted keys to ssh-agent before connecting.
+
 ## Quick start
 
 ```text
